@@ -6,7 +6,15 @@ from unittest.mock import patch
 
 import pytest
 
-from llm_bench.spec_bench import build_prompt, choose_model, parse_args, print_summary, query_models
+from llm_bench.spec_bench import (
+    build_prompt,
+    choose_model,
+    format_header,
+    format_row,
+    parse_args,
+    print_summary,
+    query_models,
+)
 
 
 class TestBuildPrompt:
@@ -97,6 +105,30 @@ class TestChooseModel:
 
         monkeypatch.setattr("builtins.input", raise_eof)
         assert choose_model(["a"]) == -1
+
+
+class TestTableFormatting:
+    """format_header and format_row alignment behavior."""
+
+    def test_row_columns_align_when_runs_widen(self) -> None:
+        row = format_row(128, 155, 81, 152.65, [160.2, 149.6, 148.2])
+        cols = row.split()
+        assert cols[0] == "128" and cols[3] == "152.65"
+        assert cols[4] == "160.2"  # first run lands in the runs column
+
+    def test_runs_column_widens_on_demand(self) -> None:
+        one = format_row(0, 20, 93, 191.65, [1.0])
+        three = format_row(0, 20, 93, 191.65, [160.2, 149.6, 148.2])
+        assert "1.0" in one
+        assert three.index("  191.65") == one.index("  191.65")
+
+    def test_tok_s_header_and_value_share_right_edge(self) -> None:
+        header = format_header()
+        row = format_row(0, 20, 93, 191.65, [1.0])
+        assert header.split()[:4] == ["ctx", "prompt_tok", "gen_tok", "tok/s"]
+        header_end = header.index("tok/s") + len("tok/s")
+        row_end = row.index("191.65") + len("191.65")
+        assert header_end == row_end
 
 
 class TestPrintSummary:
