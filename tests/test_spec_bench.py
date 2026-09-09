@@ -304,6 +304,15 @@ class TestRenderMenu:
         a_idx, b_idx = plain.index(option_rows[0]), plain.index(option_rows[1])
         assert b_idx - a_idx == 1  # options adjacent, no blank lines between
 
+    def test_redraw_keeps_title_and_does_not_duplicate_rows(self) -> None:
+        labels = ["a", "b", "c"]
+        redraw = render_menu(labels, {0}, 1, False, "Pick").split("\n")
+        plain = [re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\r", "", line) for line in redraw]
+        assert plain[0].strip() == "Pick"  # title re-rendered every frame
+        option_rows = [line for line in plain if "[x]" in line or "[ ]" in line]
+        assert len(option_rows) == len(labels)  # no duplicated trailing rows
+        assert plain[-2] == ""  # exactly one trailing separator line
+
 
 class TestParseTask:
     """parse_task behavior."""

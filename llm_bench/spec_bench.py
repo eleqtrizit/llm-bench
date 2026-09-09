@@ -302,28 +302,29 @@ def render_menu(labels: List[str], selected: set[int], cursor: int, first: bool,
     rows = []
     if first:
         rows.append("")  # blank line separating this menu from earlier output
-        rows.append(title)
+    rows.append(title)
     for i, label in enumerate(labels):
         mark = "x" if i in selected else " "
         pointer = ">" if i == cursor else " "
         rows.append(f" {pointer} [{mark}] {label}")
     rows.append("")  # blank line separating the menu from what follows
-    # Redraw the menu in place, erasing each line before rewriting it.
+    # Redraw the menu in place, erasing each line before rewriting it. The
+    # title is rendered on every frame because the erase pass wipes it.
     return "\x1b[s" + "".join(f"\r\x1b[2K{row}\n" for row in rows) + f"\x1b[{len(rows)}A"
 
 
-def menu_line_count(num_labels: int, with_title: bool = True) -> int:
-    """Count the terminal lines a rendered menu occupies.
+def menu_line_count(num_labels: int) -> int:
+    """Count the terminal lines a redrawn menu occupies below its title.
 
     Args:
         num_labels: The number of option rows in the menu.
-        with_title: Whether the first frame includes the title block.
 
     Returns:
-        The number of lines from the menu's first line to its last, including
-        the surrounding separator lines.
+        The number of lines from the title line to the trailing separator
+        line, which is also the distance to move the cursor down when the
+        menu ends.
     """
-    return num_labels + (2 if with_title else 0) + 1
+    return num_labels + 2
 
 
 def menu_multi_select(
