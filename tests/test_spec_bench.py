@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import re
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +22,7 @@ from llm_bench.spec_bench import (
     parse_ctx,
     parse_task,
     query_models,
+    render_menu,
     run_completion,
     warm_up,
 )
@@ -244,6 +246,24 @@ class TestWarmUp:
         assert len(calls) == 2
         assert all(p == WARMUP_PROMPT for p, _g in calls)
         assert all(g == WARMUP_GEN_TOKENS for _p, g in calls)
+
+
+class TestRenderMenu:
+    """render_menu spacing behavior."""
+
+    def test_menu_is_surrounded_by_blank_lines(self) -> None:
+        lines = render_menu(["a", "b"], {0}, 0, True, "Pick").split("\n")
+        plain = [re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\r", "", line) for line in lines]
+        assert plain[0] == "" and plain[1].strip() == "Pick"  # blank line before title
+        assert plain[-2] == ""  # blank line after the last option
+
+    def test_options_are_single_spaced(self) -> None:
+        lines = render_menu(["a", "b"], {0}, 0, True, "Pick").split("\n")
+        plain = [re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\r", "", line) for line in lines]
+        option_rows = [line for line in plain if "[x]" in line or "[ ]" in line]
+        assert len(option_rows) == 2
+        a_idx, b_idx = plain.index(option_rows[0]), plain.index(option_rows[1])
+        assert b_idx - a_idx == 1  # options adjacent, no blank lines between
 
 
 class TestParseTask:

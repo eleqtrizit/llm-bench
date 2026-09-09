@@ -248,13 +248,29 @@ def render_menu(labels: List[str], selected: set[int], cursor: int, first: bool,
     """
     rows = []
     if first:
+        rows.append("")  # blank line separating this menu from earlier output
         rows.append(title)
     for i, label in enumerate(labels):
         mark = "x" if i in selected else " "
         pointer = ">" if i == cursor else " "
         rows.append(f" {pointer} [{mark}] {label}")
+    rows.append("")  # blank line separating the menu from what follows
     # Redraw the menu in place, erasing each line before rewriting it.
     return "\x1b[s" + "".join(f"\r\x1b[2K{row}\n" for row in rows) + f"\x1b[{len(rows)}A"
+
+
+def menu_line_count(num_labels: int, with_title: bool = True) -> int:
+    """Count the terminal lines a rendered menu occupies.
+
+    Args:
+        num_labels: The number of option rows in the menu.
+        with_title: Whether the first frame includes the title block.
+
+    Returns:
+        The number of lines from the menu's first line to its last, including
+        the surrounding separator lines.
+    """
+    return num_labels + (2 if with_title else 0) + 1
 
 
 def menu_multi_select(
@@ -282,7 +298,7 @@ def menu_multi_select(
     """
     if not sys.stdin.isatty():
         raise ValueError("no terminal attached; use the --ctx/--task flags instead")
-    rows_len = len(labels) + 1  # title line plus options
+    rows_len = menu_line_count(len(labels))
     selected: set[int] = set(range(len(labels)))
     cursor = 0
     print(render_menu(labels, selected, cursor, True, title), end="", flush=True)
