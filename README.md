@@ -69,19 +69,21 @@ Options:
 | `-p`, `--port` | Server port (required) |
 | `--lengths` | Context lengths to test (default `0 8 16 32 64 128`) |
 | `--gen-tokens` | Max tokens generated per run (default `256`) |
-| `--runs` | Runs per length (default `3`; first run is a discarded warmup) |
-| `--keep-warmup` | Include the warmup run in the results |
 | `--timeout` | Request timeout in seconds (default `600`) |
 
 Example output:
 
 ```text
 llm-bench: http://127.0.0.1:8080  model=qwen2.5-7b-instruct
+gen_tokens=256, one run per context length
 
-  ctx prompt_tok gen_tok        tok/s       runs
---------------------------------------------------
-Summary (mean tok/s):
-  ctx=0      10.00 tok/s  |#####
+  ctx prompt_tok gen_tok     tok/s
+----------------------------------
+    0         20      93    187.74
+    8         44     190    125.62
+
+Summary (tok/s):
+  ctx=0    187.74 tok/s  |#####
 ```
 
 ## Development

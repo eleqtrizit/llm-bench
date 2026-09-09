@@ -44,8 +44,6 @@ class TestParseArgs:
         assert args.host == "10.0.0.5"
         assert args.port == 8080
         assert args.gen_tokens == 256
-        assert args.runs == 3
-        assert not args.keep_warmup
 
     def test_missing_host_exits(self) -> None:
         with pytest.raises(SystemExit):
@@ -110,22 +108,15 @@ class TestChooseModel:
 class TestTableFormatting:
     """format_header and format_row alignment behavior."""
 
-    def test_row_columns_align_when_runs_widen(self) -> None:
-        row = format_row(128, 155, 81, 152.65, [160.2, 149.6, 148.2])
+    def test_row_has_four_columns(self) -> None:
+        row = format_row(128, 155, 81, 152.65)
         cols = row.split()
-        assert cols[0] == "128" and cols[3] == "152.65"
-        assert cols[4] == "160.2"  # first run lands in the runs column
-
-    def test_runs_column_widens_on_demand(self) -> None:
-        one = format_row(0, 20, 93, 191.65, [1.0])
-        three = format_row(0, 20, 93, 191.65, [160.2, 149.6, 148.2])
-        assert "1.0" in one
-        assert three.index("  191.65") == one.index("  191.65")
+        assert cols == ["128", "155", "81", "152.65"]
 
     def test_tok_s_header_and_value_share_right_edge(self) -> None:
         header = format_header()
-        row = format_row(0, 20, 93, 191.65, [1.0])
-        assert header.split()[:4] == ["ctx", "prompt_tok", "gen_tok", "tok/s"]
+        row = format_row(0, 20, 93, 191.65)
+        assert header.split() == ["ctx", "prompt_tok", "gen_tok", "tok/s"]
         header_end = header.index("tok/s") + len("tok/s")
         row_end = row.index("191.65") + len("191.65")
         assert header_end == row_end
@@ -135,15 +126,15 @@ class TestPrintSummary:
     """print_summary behavior."""
 
     def test_skips_when_single_result(self, capsys: pytest.CaptureFixture) -> None:
-        print_summary({0: [10.0]})
+        print_summary({0: 10.0})
         assert capsys.readouterr().out == ""
 
     def test_prints_bars_for_multiple_results(
         self, capsys: pytest.CaptureFixture
     ) -> None:
-        results = {0: [10.0], 8: [20.0]}
+        results = {0: 10.0, 8: 20.0}
         print_summary(results)
         out = capsys.readouterr().out
-        assert "Summary (mean tok/s):" in out
+        assert "Summary (tok/s):" in out
         assert "ctx=0" in out and "ctx=8" in out
         assert "#####" in out  # 20.0 / 2 = 10 hashes
