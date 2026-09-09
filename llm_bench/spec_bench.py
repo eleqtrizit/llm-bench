@@ -382,8 +382,8 @@ def format_header() -> str:
         The fixed-width header line; its length matches the dash separator.
     """
     return (
-        f"{'ctx':>5} {'prompt_tok':>10} {'gen_tok':>7} "
-        f"{'prefill tok/s':>13} {'tok/s':>9}"
+        f"{'ctx':>8} {'prompt_tok':>13} {'gen_tok':>10} "
+        f"{'prefill tok/s':>16} {'tok/s':>12}"
     )
 
 
@@ -406,7 +406,7 @@ def format_row(
     ctx_str = f"{ctx_k}k" if ctx_k else "0"
     prefill_str = f"{prefill_tok_s:.2f}" if prefill_tok_s > 0 else "-"
     return (
-        f"{ctx_str:>5} {prompt_tok:>10} {gen_tok:>7} {prefill_str:>13} {tok_s:>9.2f}"
+        f"{ctx_str:>8} {prompt_tok:>13} {gen_tok:>10} {prefill_str:>16} {tok_s:>12.2f}"
     )
 
 
@@ -438,7 +438,7 @@ def bench_lengths(
                 base_url, model, prompt, gen_tokens, timeout
             )
         except Exception as e:  # noqa: BLE001 - report and continue
-            print(f"{ctx:>5}  FAILED: {e}")
+            print(f"{ctx:>8}   FAILED: {e}")
             continue
         results[ctx] = tok_s
         print(format_row(ctx, prompt_tok, g_tok, prefill_tok_s, tok_s))
