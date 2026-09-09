@@ -15,9 +15,14 @@ import termios
 import time
 import tty
 import urllib.request
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 DEFAULT_CTX_OPTIONS = [0, 8, 32, 64, 128, 200]
+TASKS: Dict[str, str] = {
+    "count": "Count to 1000.",
+    "code": "Write a Python Snake game.",
+    "prose": "Write me a poem about Agents and LLMs.",
+}
 DEFAULT_GEN_TOKENS = 256
 DEFAULT_TIMEOUT = 600
 
@@ -29,7 +34,9 @@ FILLER = (
 )
 
 
-def build_prompt(ctx_k: int, rng: random.Random | None = None) -> str:
+def build_prompt(
+    ctx_k: int, task_prompt: str = "", rng: random.Random | None = None
+) -> str:
     """Build a prompt with roughly ``ctx_k`` kilotokens of filler context.
 
     The filler is drawn from ``FILLER`` but shuffled fresh on every call, and
@@ -38,14 +45,16 @@ def build_prompt(ctx_k: int, rng: random.Random | None = None) -> str:
     server-side prompt and KV-cache reuse from inflating the prefill numbers.
 
     Args:
-        ctx_k: Context size in kilotokens; 0 produces a short prompt.
+        ctx_k: Context size in kilotokens; 0 produces just the task prompt.
+        task_prompt: The generation instruction appended after the filler.
         rng: Optional seeded random source for deterministic prompts in tests.
 
     Returns:
         The prompt text, padded with shuffled filler words when ``ctx_k > 0``.
     """
+    task_prompt = task_prompt or "Count to 1000."
     if ctx_k <= 0:
-        return "Count from 1 to 20."
+        return task_prompt
     rng = rng if rng is not None else random.Random()
     pool = FILLER.split()
     n_words = max(1, int(ctx_k * 1024 * 0.75))  # ~0.75 words per token
@@ -57,7 +66,7 @@ def build_prompt(ctx_k: int, rng: random.Random | None = None) -> str:
     filler = " ".join(words[:n_words])
     return (
         f"Read the following text carefully:\n\n{filler}\n\n"
-        "Now, ignoring the text above entirely, count from 1 to 20."
+        f"Now, ignoring the text above entirely, {task_prompt}"
     )
 
 
@@ -224,77 +233,152 @@ def read_key() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def render_menu(options: List[int], selected: set[int], cursor: int, first: bool) -> str:
-    """Render the context-length selection menu.
+def render_menu(labels: List[str], selected: set[int], cursor: int, first: bool, title: str) -> str:
+    """Render a multi-select menu.
 
     Args:
-        options: The selectable context sizes, in kilotokens.
+        labels: The text shown for each option.
         selected: Indices of currently toggled-on options.
         cursor: Index of the option the cursor is on.
-        first: When True, render the header line too.
+        first: When True, render the title line too.
+        title: The menu's instruction line.
 
     Returns:
         The escape-sequence string to write to the terminal.
     """
     rows = []
     if first:
-        rows.append(
-            "Select context lengths (space: toggle, up/down: move,"
-            " a: all/none, enter: start, q: quit)"
-        )
-    for i, opt in enumerate(options):
+        rows.append(title)
+    for i, label in enumerate(labels):
         mark = "x" if i in selected else " "
         pointer = ">" if i == cursor else " "
-        label = f"{opt}k" if opt else "0"
         rows.append(f" {pointer} [{mark}] {label}")
-    # Move the cursor above the rendered rows and redraw them, erasing each line.
+    # Redraw the menu in place, erasing each line before rewriting it.
     return "\x1b[s" + "".join(f"\r\x1b[2K{row}\n" for row in rows) + f"\x1b[{len(rows)}A"
 
 
-def menu_select_ctx(options: List[int]) -> List[int] | None:
-    """Show the interactive context-length multi-select menu.
+def menu_multi_select(
+    labels: List[str], title: str, allow_empty: bool, empty_hint: str = ""
+) -> set[int] | None:
+    """Show an interactive multi-select menu and return the chosen indices.
 
     All options start selected. Space toggles the option under the cursor,
     ``a`` toggles all, enter confirms, and ``q`` aborts.
 
     Args:
-        options: The selectable context sizes, in kilotokens.
+        labels: The text shown for each option.
+        title: The menu's instruction line.
+        allow_empty: When False, an empty selection re-prompts instead of
+            confirming.
+        empty_hint: Message shown when confirming an empty selection is not
+            allowed.
 
     Returns:
-        The chosen context sizes in kilotokens, or None when the user quits.
+        The chosen option indices, or None when the user quits.
 
     Raises:
         ValueError: If not attached to a terminal.
-        KeyboardInterrupt: On Ctrl-C.
+        KeyboardInterrupt: If the user aborts with Ctrl-C.
     """
     if not sys.stdin.isatty():
-        raise ValueError("no terminal attached; pass --ctx 0,8,... instead")
-    selected: set[int] = set(range(len(options)))
+        raise ValueError("no terminal attached; use the --ctx/--task flags instead")
+    rows_len = len(labels) + 1  # title line plus options
+    selected: set[int] = set(range(len(labels)))
     cursor = 0
-    print(render_menu(options, selected, cursor, True), end="", flush=True)
+    print(render_menu(labels, selected, cursor, True, title), end="", flush=True)
     while True:
         key = read_key()
         if key == "quit":
-            print(f"\x1b[{len(options) + 1}B")
+            print(f"\x1b[{rows_len}B")
             return None
         if key == "enter":
-            print(f"\x1b[{len(options) + 1}B")
-            return [options[i] for i in sorted(selected)]
+            if not selected and not allow_empty:
+                print(f"\r\x1b[2K{empty_hint}", end="", flush=True)
+                continue
+            print(f"\x1b[{rows_len}B")
+            return selected
         if key == "up":
-            cursor = (cursor - 1) % len(options)
+            cursor = (cursor - 1) % len(labels)
         elif key == "down":
-            cursor = (cursor + 1) % len(options)
+            cursor = (cursor + 1) % len(labels)
         elif key == "space":
             if cursor in selected:
                 selected.remove(cursor)
             else:
                 selected.add(cursor)
         elif key == "a":
-            if len(selected) == len(options):
+            if len(selected) == len(labels):
                 selected = set()
             else:
-                selected = set(range(len(options)))
-        print(render_menu(options, selected, cursor, False), end="", flush=True)
+                selected = set(range(len(labels)))
+        print(render_menu(labels, selected, cursor, False, title), end="", flush=True)
+
+
+def menu_select_ctx(options: List[int]) -> List[int] | None:
+    """Show the interactive context-length multi-select menu.
+
+    Args:
+        options: The selectable context sizes, in kilotokens.
+
+    Returns:
+        The chosen context sizes in kilotokens, or None when the user quits.
+    """
+    if not sys.stdin.isatty():
+        raise ValueError("no terminal attached; pass --ctx 0,8,... instead")
+    chosen = menu_multi_select(
+        [f"{opt}k" if opt else "0" for opt in options],
+        "Select context lengths (space: toggle, up/down: move,"
+        " a: all/none, enter: start, q: quit)",
+        allow_empty=False,
+        empty_hint="Select at least one context size.",
+    )
+    if chosen is None:
+        return None
+    return [options[i] for i in sorted(chosen)]
+
+
+def menu_select_tasks() -> List[str] | None:
+    """Show the interactive generation-task multi-select menu.
+
+    Returns:
+        The chosen task names, or None when the user quits.
+    """
+    if not sys.stdin.isatty():
+        raise ValueError("no terminal attached; pass --task count,code,prose")
+    chosen = menu_multi_select(
+        [f"{name} ({prompt})" for name, prompt in TASKS.items()],
+        "Select generation tasks (space: toggle, up/down: move,"
+        " a: all/none, enter: start, q: quit)",
+        allow_empty=False,
+        empty_hint="Select at least one task.",
+    )
+    if chosen is None:
+        return None
+    return [list(TASKS)[i] for i in sorted(chosen)]
+
+
+def parse_task(raw: str) -> List[str]:
+    """Parse a comma-separated ``--task`` value list.
+
+    Args:
+        raw: Comma-separated task names, for example ``count,code``.
+
+    Returns:
+        The parsed task names.
+
+    Raises:
+        argparse.ArgumentTypeError: If any name is not a known task.
+    """
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    unknown = [n for n in names if n not in TASKS]
+    if not names:
+        raise argparse.ArgumentTypeError("select at least one task")
+    if unknown:
+        known = ", ".join(TASKS)
+        raise argparse.ArgumentTypeError(
+            f"unknown task(s): {', '.join(unknown)} (known: {known})"
+        )
+    return names
 
 
 def parse_ctx(raw: str) -> List[int]:
@@ -353,6 +437,14 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--task",
+        type=parse_task,
+        help=(
+            "comma-separated generation tasks (count, code, prose); required"
+            " if non-interactive, otherwise the menu opens"
+        ),
+    )
+    ap.add_argument(
         "--gen-tokens",
         type=int,
         default=DEFAULT_GEN_TOKENS,
@@ -396,18 +488,24 @@ def format_header() -> str:
         The fixed-width header line; its length matches the dash separator.
     """
     return (
-        f"{'ctx':>8} {'prompt_tok':>13} {'gen_tok':>10} "
+        f"{'ctx':>8} {'task':<6} {'prompt_tok':>13} {'gen_tok':>10} "
         f"{'prefill tok/s':>16} {'tok/s':>12}"
     )
 
 
 def format_row(
-    ctx_k: int, prompt_tok: int, gen_tok: int, prefill_tok_s: float, tok_s: float
+    ctx_k: int,
+    task: str,
+    prompt_tok: int,
+    gen_tok: int,
+    prefill_tok_s: float,
+    tok_s: float,
 ) -> str:
     """Build one aligned results-table row.
 
     Args:
         ctx_k: The context size of this row, in kilotokens.
+        task: The generation task of this row.
         prompt_tok: Prompt tokens reported by the server for this run.
         gen_tok: Completion tokens generated in this run.
         prefill_tok_s: Estimated prefill throughput; 0.0 means unknown.
@@ -420,7 +518,8 @@ def format_row(
     ctx_str = f"{ctx_k}k" if ctx_k else "0"
     prefill_str = f"{prefill_tok_s:.2f}" if prefill_tok_s > 0 else "-"
     return (
-        f"{ctx_str:>8} {prompt_tok:>13} {gen_tok:>10} {prefill_str:>16} {tok_s:>12.2f}"
+        f"{ctx_str:>8} {task:<6} {prompt_tok:>13} {gen_tok:>10} "
+        f"{prefill_str:>16} {tok_s:>12.2f}"
     )
 
 
@@ -428,31 +527,34 @@ def bench_lengths(
     base_url: str,
     model: str,
     lengths: List[int],
+    tasks: List[str],
     gen_tokens: int,
     timeout: int,
 ) -> None:
-    """Benchmark each context size once and print its result row.
+    """Benchmark every selected task at each context size and print the rows.
 
     Args:
         base_url: Server root, for example ``http://127.0.0.1:8080``.
         model: Model name as served by the endpoint.
         lengths: Context sizes to test, in kilotokens.
+        tasks: Generation task names, in :data:`TASKS`.
         gen_tokens: Maximum tokens to generate per run.
         timeout: Request timeout in seconds.
 
     Returns:
-        None. Each completed size is printed as one table row.
+        None. Each completed run is printed as one table row.
     """
     for ctx in lengths:
-        prompt = build_prompt(ctx)
-        try:
-            tok_s, prefill_tok_s, prompt_tok, g_tok, _ttft = run_completion(
-                base_url, model, prompt, gen_tokens, timeout
-            )
-        except Exception as e:  # noqa: BLE001 - report and continue
-            print(f"{ctx:>8}   FAILED: {e}")
-            continue
-        print(format_row(ctx, prompt_tok, g_tok, prefill_tok_s, tok_s))
+        for task in tasks:
+            prompt = build_prompt(ctx, TASKS[task])
+            try:
+                tok_s, prefill_tok_s, prompt_tok, g_tok, _ttft = run_completion(
+                    base_url, model, prompt, gen_tokens, timeout
+                )
+            except Exception as e:  # noqa: BLE001 - report and continue
+                print(f"{ctx:>8} {task:<6}   FAILED: {e}")
+                continue
+            print(format_row(ctx, task, prompt_tok, g_tok, prefill_tok_s, tok_s))
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -494,6 +596,17 @@ def main(argv: List[str] | None = None) -> None:
         if lengths is None:
             raise SystemExit("cancelled.")
 
+    tasks = args.task
+    if tasks is None:
+        try:
+            tasks = menu_select_tasks()
+        except ValueError as e:
+            raise SystemExit(f"error: {e}") from e
+        except KeyboardInterrupt:
+            raise SystemExit("cancelled.") from None
+        if tasks is None:
+            raise SystemExit("cancelled.")
+
     try:
         warm_up(base_url, model, args.timeout)
     except Exception as e:
@@ -509,6 +622,7 @@ def main(argv: List[str] | None = None) -> None:
         base_url,
         model,
         lengths,
+        tasks,
         args.gen_tokens,
         args.timeout,
     )

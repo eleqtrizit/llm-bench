@@ -10,13 +10,16 @@ import pytest
 from llm_bench.spec_bench import (
     WARMUP_GEN_TOKENS,
     WARMUP_PROMPT,
+    TASKS,
     build_prompt,
     choose_model,
     format_header,
     format_row,
     menu_select_ctx,
+    menu_select_tasks,
     parse_args,
     parse_ctx,
+    parse_task,
     query_models,
     run_completion,
     warm_up,
@@ -27,10 +30,10 @@ class TestBuildPrompt:
     """build_prompt behavior."""
 
     def test_zero_ctx_returns_short_prompt(self) -> None:
-        assert build_prompt(0) == "Count from 1 to 20."
+        assert build_prompt(0) == "Count to 1000."
 
     def test_negative_ctx_returns_short_prompt(self) -> None:
-        assert build_prompt(-5) == "Count from 1 to 20."
+        assert build_prompt(-5) == "Count to 1000."
 
     def test_larger_ctx_gives_longer_prompt(self) -> None:
         short = build_prompt(1)
@@ -43,7 +46,7 @@ class TestBuildPrompt:
         assert abs(two_k / one_k - 2) < 0.1
 
     def test_prompt_mentions_task(self) -> None:
-        assert "count from 1 to 20" in build_prompt(1)
+        assert "Count to 1000." in build_prompt(1)
 
     def test_prompts_are_unique_per_call(self) -> None:
         assert build_prompt(8) != build_prompt(8)
@@ -52,7 +55,7 @@ class TestBuildPrompt:
         import random
 
         rng = random.Random(42)
-        assert build_prompt(1, rng) == build_prompt(1, random.Random(42))
+        assert build_prompt(1, "Count.", rng) == build_prompt(1, "Count.", random.Random(42))
 
 
 class TestParseArgs:
@@ -163,18 +166,20 @@ class TestTableFormatting:
     """format_header and format_row alignment behavior."""
 
     def test_row_has_five_columns(self) -> None:
-        row = format_row(8, 155, 81, 900.0, 152.65)
+        row = format_row(8, "count", 155, 81, 900.0, 152.65)
         cols = row.split()
-        assert cols == ["8k", "155", "81", "900.00", "152.65"]
+        assert cols == ["8k", "count", "155", "81", "900.00", "152.65"]
 
     def test_row_shows_dash_for_unknown_prefill(self) -> None:
-        row = format_row(0, 20, 93, 0.0, 191.65)
-        assert row.split()[3] == "-"
+        row = format_row(0, "prose", 20, 93, 0.0, 191.65)
+        assert row.split()[4] == "-"
 
     def test_tok_s_header_and_value_share_right_edge(self) -> None:
         header = format_header()
-        row = format_row(0, 20, 93, 900.0, 191.65)
-        assert header.split() == ["ctx", "prompt_tok", "gen_tok", "prefill", "tok/s", "tok/s"]
+        row = format_row(0, "prose", 20, 93, 900.0, 191.65)
+        assert header.split() == [
+            "ctx", "task", "prompt_tok", "gen_tok", "prefill", "tok/s", "tok/s"
+        ]
         header_end = header.rindex("tok/s") + len("tok/s")
         row_end = row.index("191.65") + len("191.65")
         assert header_end == row_end
@@ -239,3 +244,40 @@ class TestWarmUp:
         assert len(calls) == 2
         assert all(p == WARMUP_PROMPT for p, _g in calls)
         assert all(g == WARMUP_GEN_TOKENS for _p, g in calls)
+
+
+class TestParseTask:
+    """parse_task behavior."""
+
+    def test_parses_comma_separated_names(self) -> None:
+        assert parse_task("count,code") == ["count", "code"]
+
+    def test_rejects_unknown_task(self) -> None:
+        with pytest.raises(argparse.ArgumentTypeError, match="unknown task"):
+            parse_task("sing")
+
+    def test_empty_selection_rejected(self) -> None:
+        with pytest.raises(argparse.ArgumentTypeError, match="at least one"):
+            parse_task("")
+
+
+class TestMenuSelectTasks:
+    """menu_select_tasks behavior."""
+
+    def test_requires_tty(self) -> None:
+        with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
+            fake_stdin.isatty.return_value = False
+            with pytest.raises(ValueError, match="--task"):
+                menu_select_tasks()
+
+    def test_returns_selected_task_names(self) -> None:
+        with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
+            fake_stdin.isatty.return_value = True
+            with patch("llm_bench.spec_bench.menu_multi_select", return_value={0, 2}):
+                assert menu_select_tasks() == [list(TASKS)[0], list(TASKS)[2]]
+
+    def test_requires_tty_context_menu(self) -> None:
+        with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
+            fake_stdin.isatty.return_value = False
+            with pytest.raises(ValueError, match="--ctx"):
+                menu_select_ctx([0, 8])
