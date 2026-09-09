@@ -84,12 +84,12 @@ llm-bench --host 127.0.0.1 --port 8080 --ctx 0,8,16
 ```
 
 The `--task` flag picks what the model generates. The built-in tasks are
-`count` (Count to 1000), `code` (Write a Python Snake game), and `prose`
-(Write me a poem about Agents and LLMs). If you omit `--task`, a multi-select
+`code` (Write a Python Snake game) and `prose` (Write me a poem about Agents
+and LLMs). If you omit `--task`, a multi-select
 menu opens with the same spacebar controls; you must select at least one:
 
 ```bash
-llm-bench --host 127.0.0.1 --port 8080 --ctx 0,8 --task count,prose
+llm-bench --host 127.0.0.1 --port 8080 --ctx 0,8 --task code,prose
 ```
 
 Options:
@@ -100,7 +100,7 @@ Options:
 | `-h`, `--host` | Server host (required) |
 | `-p`, `--port` | Server port (required) |
 | `--ctx` | Comma-separated context sizes in kilotokens, for example `0,8,16` (optional; omit to pick from the interactive menu) |
-| `--task` | Comma-separated generation tasks (`count`, `code`, `prose`; optional; omit to pick from the interactive menu) |
+| `--task` | Comma-separated generation tasks (`code`, `prose`; optional; omit to pick from the interactive menu) |
 | `--gen-tokens` | Max tokens generated per run (default `256`) |
 | `--timeout` | Request timeout in seconds (default `600`) |
 
@@ -112,8 +112,7 @@ gen_tokens=256, one run per context size
 
      ctx task      prompt_tok    gen_tok    prefill tok/s        tok/s
 ----------------------------------------------------------------------
-       0 count             20         93                -       187.74
-      8k count           6160        256          4520.31       178.40
+      8k code            6160        256          4520.31       178.40
       8k prose           6201        180          4108.83       165.12
 
 ```

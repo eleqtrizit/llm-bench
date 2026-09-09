@@ -20,7 +20,6 @@ from typing import Dict, List
 
 DEFAULT_CTX_OPTIONS = [0, 8, 32, 64, 128, 200]
 TASKS: Dict[str, str] = {
-    "count": "Count to 1000.",
     "code": "Write a Python Snake game.",
     "prose": "Write me a poem about Agents and LLMs.",
 }
@@ -53,7 +52,7 @@ def build_prompt(
     Returns:
         The prompt text, padded with shuffled filler words when ``ctx_k > 0``.
     """
-    task_prompt = task_prompt or "Count to 1000."
+    task_prompt = task_prompt or "Write a Python Snake game."
     if ctx_k <= 0:
         return task_prompt
     rng = rng if rng is not None else random.Random()
@@ -414,7 +413,7 @@ def menu_select_tasks() -> List[str] | None:
         The chosen task names, or None when the user quits.
     """
     if not sys.stdin.isatty():
-        raise ValueError("no terminal attached; pass --task count,code,prose")
+        raise ValueError("no terminal attached; pass --task code,prose")
     chosen = menu_multi_select(
         [f"{name} ({prompt.rstrip('.')})" for name, prompt in TASKS.items()],
         "Select generation tasks (space: toggle, up/down: move,"
@@ -431,7 +430,7 @@ def parse_task(raw: str) -> List[str]:
     """Parse a comma-separated ``--task`` value list.
 
     Args:
-        raw: Comma-separated task names, for example ``count,code``.
+        raw: Comma-separated task names, for example ``code,prose``.
 
     Returns:
         The parsed task names.
@@ -510,7 +509,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         "--task",
         type=parse_task,
         help=(
-            "comma-separated generation tasks (count, code, prose); required"
+            "comma-separated generation tasks (code, prose); required"
             " if non-interactive, otherwise the menu opens"
         ),
     )

@@ -32,10 +32,10 @@ class TestBuildPrompt:
     """build_prompt behavior."""
 
     def test_zero_ctx_returns_short_prompt(self) -> None:
-        assert build_prompt(0) == "Count to 1000."
+        assert build_prompt(0) == "Write a Python Snake game."
 
     def test_negative_ctx_returns_short_prompt(self) -> None:
-        assert build_prompt(-5) == "Count to 1000."
+        assert build_prompt(-5) == "Write a Python Snake game."
 
     def test_larger_ctx_gives_longer_prompt(self) -> None:
         short = build_prompt(1)
@@ -48,7 +48,7 @@ class TestBuildPrompt:
         assert abs(two_k / one_k - 2) < 0.1
 
     def test_prompt_mentions_task(self) -> None:
-        assert "Count to 1000." in build_prompt(1)
+        assert "Write a Python Snake game." in build_prompt(1)
 
     def test_prompts_are_unique_per_call(self) -> None:
         assert build_prompt(8) != build_prompt(8)
@@ -168,9 +168,9 @@ class TestTableFormatting:
     """format_header and format_row alignment behavior."""
 
     def test_row_has_five_columns(self) -> None:
-        row = format_row(8, "count", 155, 81, 900.0, 152.65)
+        row = format_row(8, "prose", 155, 81, 900.0, 152.65)
         cols = row.split()
-        assert cols == ["8k", "count", "155", "81", "900.00", "152.65"]
+        assert cols == ["8k", "prose", "155", "81", "900.00", "152.65"]
 
     def test_row_shows_dash_for_unknown_prefill(self) -> None:
         row = format_row(0, "prose", 20, 93, 0.0, 191.65)
@@ -318,7 +318,7 @@ class TestParseTask:
     """parse_task behavior."""
 
     def test_parses_comma_separated_names(self) -> None:
-        assert parse_task("count,code") == ["count", "code"]
+        assert parse_task("code,prose") == ["code", "prose"]
 
     def test_rejects_unknown_task(self) -> None:
         with pytest.raises(argparse.ArgumentTypeError, match="unknown task"):
@@ -341,8 +341,8 @@ class TestMenuSelectTasks:
     def test_returns_selected_task_names(self) -> None:
         with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
             fake_stdin.isatty.return_value = True
-            with patch("llm_bench.spec_bench.menu_multi_select", return_value={0, 2}):
-                assert menu_select_tasks() == [list(TASKS)[0], list(TASKS)[2]]
+            with patch("llm_bench.spec_bench.menu_multi_select", return_value={0, 1}):
+                assert menu_select_tasks() == [list(TASKS)[0], list(TASKS)[1]]
 
     def test_requires_tty_context_menu(self) -> None:
         with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
