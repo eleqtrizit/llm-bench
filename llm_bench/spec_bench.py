@@ -49,8 +49,12 @@ def build_prompt(ctx_k: int) -> str:
 
 def run_completion(
     base_url: str, model: str, prompt: str, gen_tokens: int, timeout: int
-) -> Tuple[float, int, int, float]:
-    """Run a single non-streaming chat completion.
+) -> Tuple[float, float, int, int, float]:
+    """Run a single streaming chat completion and time its phases.
+
+    The request streams server-sent events. Time-to-first-token bounds the
+    prefill phase, so prefill tok/s is estimated as ``prompt_tokens / TTFT``.
+    Generation tok/s counts only the time after the first token.
 
     Args:
         base_url: Server root, for example ``http://127.0.0.1:8080``.
@@ -60,7 +64,9 @@ def run_completion(
         timeout: Request timeout in seconds.
 
     Returns:
-        A ``(tok_s, prompt_tokens, gen_tokens, seconds)`` tuple.
+        A ``(gen_tok_s, prefill_tok_s, prompt_tokens, gen_tokens, ttft_s)``
+        tuple. ``prefill_tok_s`` is 0.0 when the server produced no prompt
+        token count.
 
     Raises:
         RuntimeError: If the server responds but generates no tokens.
@@ -72,7 +78,8 @@ def run_completion(
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": gen_tokens,
             "temperature": 0.0,
-            "stream": False,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
     ).encode()
 
@@ -83,23 +90,44 @@ def run_completion(
         method="POST",
     )
 
+    n_chunk_tokens = 0
+    n_prompt = 0
+    n_gen = 0
+    ttft = 0.0
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = json.loads(resp.read())
-    dt = time.perf_counter() - t0
+        for raw_line in resp:
+            line = raw_line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            prefix = b"data:"
+            data = line[len(prefix):].strip()
+            if data in (b"", b"[DONE]"):
+                continue
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            usage = chunk.get("usage")
+            if usage:
+                n_prompt = usage.get("prompt_tokens", n_prompt)
+                n_gen = usage.get("completion_tokens", n_gen)
+            for choice in chunk.get("choices", []):
+                delta = choice.get("delta", {})
+                if delta.get("content"):
+                    n_chunk_tokens += 1
+                    if ttft == 0.0:
+                        ttft = time.perf_counter() - t0
+    total = time.perf_counter() - t0
 
-    usage = body.get("usage", {})
-    n_gen = usage.get("completion_tokens", 0)
-    n_prompt = usage.get("prompt_tokens", 0)
     if n_gen <= 0:
-        # Fall back to counting content words.
-        try:
-            n_gen = len(body["choices"][0]["message"]["content"].split())
-        except (KeyError, IndexError, TypeError):
-            n_gen = 0
+        n_gen = n_chunk_tokens
     if n_gen <= 0:
-        raise RuntimeError(f"no tokens generated: {body}")
-    return n_gen / dt, n_prompt, n_gen, dt
+        raise RuntimeError("no tokens generated in streaming response")
+    gen_seconds = max(total - ttft, 1e-9)
+    gen_tok_s = n_gen / gen_seconds
+    prefill_tok_s = n_prompt / ttft if (n_prompt and ttft > 0) else 0.0
+    return gen_tok_s, prefill_tok_s, n_prompt, n_gen, ttft
 
 
 def query_models(base_url: str, timeout: int) -> List[str]:
@@ -353,23 +381,33 @@ def format_header() -> str:
     Returns:
         The fixed-width header line; its length matches the dash separator.
     """
-    return f"{'ctx':>5} {'prompt_tok':>10} {'gen_tok':>7} {'tok/s':>9}"
+    return (
+        f"{'ctx':>5} {'prompt_tok':>10} {'gen_tok':>7} "
+        f"{'prefill tok/s':>13} {'tok/s':>9}"
+    )
 
 
-def format_row(ctx_k: int, prompt_tok: int, gen_tok: int, tok_s: float) -> str:
+def format_row(
+    ctx_k: int, prompt_tok: int, gen_tok: int, prefill_tok_s: float, tok_s: float
+) -> str:
     """Build one aligned results-table row.
 
     Args:
         ctx_k: The context size of this row, in kilotokens.
         prompt_tok: Prompt tokens reported by the server for this run.
         gen_tok: Completion tokens generated in this run.
+        prefill_tok_s: Estimated prefill throughput; 0.0 means unknown.
         tok_s: Generation throughput of this run in tokens per second.
 
     Returns:
-        The formatted row, aligned with the header columns.
+        The formatted row, aligned with the header columns. Unknown prefill
+        is rendered as ``-``.
     """
     ctx_str = f"{ctx_k}k" if ctx_k else "0"
-    return f"{ctx_str:>5} {prompt_tok:>10} {gen_tok:>7} {tok_s:>9.2f}"
+    prefill_str = f"{prefill_tok_s:.2f}" if prefill_tok_s > 0 else "-"
+    return (
+        f"{ctx_str:>5} {prompt_tok:>10} {gen_tok:>7} {prefill_str:>13} {tok_s:>9.2f}"
+    )
 
 
 def bench_lengths(
@@ -396,14 +434,14 @@ def bench_lengths(
     for ctx in lengths:
         prompt = build_prompt(ctx)
         try:
-            tok_s, prompt_tok, g_tok, _dt = run_completion(
+            tok_s, prefill_tok_s, prompt_tok, g_tok, _ttft = run_completion(
                 base_url, model, prompt, gen_tokens, timeout
             )
         except Exception as e:  # noqa: BLE001 - report and continue
             print(f"{ctx:>5}  FAILED: {e}")
             continue
         results[ctx] = tok_s
-        print(format_row(ctx, prompt_tok, g_tok, tok_s))
+        print(format_row(ctx, prompt_tok, g_tok, prefill_tok_s, tok_s))
     return results
 
 

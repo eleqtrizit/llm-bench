@@ -52,6 +52,11 @@ uvx git+https://github.com/eleqtrizit/llm-bench --model <model> --host <host> --
 Before measuring, the tool sends two short zero-context warmup requests so the
 server has the model fully loaded.
 
+Measured runs stream their response. Time-to-first-token bounds the prefill
+phase, so prefill tok/s is estimated as `prompt_tokens / TTFT`. Generation
+tok/s counts only the time after the first token. A dash in the prefill
+column means the server reported no prompt token count.
+
 ```bash
 llm-bench --model qwen2.5-7b-instruct --host 127.0.0.1 --port 8080
 ```
@@ -87,12 +92,12 @@ Example output:
 
 ```text
 llm-bench: http://127.0.0.1:8080  model=qwen2.5-7b-instruct
-gen_tokens=256, one run per context length
+gen_tokens=256, one run per context size
 
-  ctx prompt_tok gen_tok     tok/s
-----------------------------------
-    0         20      93    187.74
-    8         44     190    125.62
+  ctx prompt_tok gen_tok prefill tok/s     tok/s
+--------------------------------------------------
+    0         20      93              -    187.74
+   8k       6160     256        4520.31    178.40
 
 Summary (tok/s):
   ctx=0    187.74 tok/s  |#####
