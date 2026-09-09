@@ -10,15 +10,15 @@ install-prod:  ## Install with development dependencies
 	uv sync --no-dev
 
 test:  ## Run tests
-	pytest tests/ -v
+	uv run pytest tests/ -v
 
 lint:  ## Run linters
-	python -m compileall -q . # checks for errors
-	flake8 *.py
-	mypy *.py
+	uv run python -m compileall -q llm_bench tests
+	uv run flake8 llm_bench tests
+	uv run mypy llm_bench tests
 
 format:  ## Format code
-	autopep8 -a  --in-place --recursive .
+	uv run autopep8 -a --in-place --recursive .
 
 clean:  ## Clean build artifacts
 	rm -rf build/
@@ -31,5 +31,5 @@ clean:  ## Clean build artifacts
 	find . -type f -name "*.pyc" -delete
 
 
-run:
-	python -m llm-bench
+run:  ## Run the benchmark CLI
+	uv run llm-spec-bench

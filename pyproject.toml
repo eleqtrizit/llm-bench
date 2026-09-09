@@ -1,34 +1,34 @@
 [project]
 name = "llm-bench"
 version = "0.1.0"
-description = "Add your description here"
+description = "Benchmark tok/s on any OpenAI-compatible server"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = [
-    "autopep8>=2.3.2",
-    "flake8>=7.3.0",
-    "isort>=9.0.1",
-    "mypy>=2.3.1",
-    "rich>=15.0.0",
-]
+license = { text = "MIT" }
+dependencies = []
 
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-    "pytest-cov>=7.1.0",
-]
-## LLM UPDATE THIS
 [project.scripts]
-name-of-app = "name-of-app.__main__:main"
-description = "UPDATE"
+llm-spec-bench = "llm_bench.spec_bench:main"
 
-readme = "README.md"
-requires-python = ">=3.11"
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["llm_bench"]
+
+[tool.uv]
+package = true
+managed = true
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
+    "autopep8>=2.3.2",
+    "flake8>=7.3.0",
+    "isort>=9.0.1",
+    "mypy>=2.3.1",
 ]
 
 [tool.pycodestyle]
@@ -42,11 +42,3 @@ line_length = 120
 
 [tool.coverage.run]
 omit = ["*/test/*"]
-
-[build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
-
-[tool.uv]
-package = true
-managed = true
