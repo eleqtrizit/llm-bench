@@ -52,10 +52,12 @@ uvx git+https://github.com/eleqtrizit/llm-bench --model <model> --host <host> --
 Before measuring, the tool sends two short zero-context warmup requests so the
 server has the model fully loaded.
 
-Measured runs stream their response. Time-to-first-token bounds the prefill
-phase, so prefill tok/s is estimated as `prompt_tokens / TTFT`. Generation
-tok/s counts only the time after the first token. A dash in the prefill
-column means the server reported no prompt token count.
+Measured runs stream their response. The tool autodetects the best phase-rate
+source per run: llama.cpp-style `timings` counters from the final chunk when
+present, otherwise time-to-first-token (which includes reasoning tokens on
+thinking models). Generation tok/s always counts first token to last. Rows
+marked with an asterisk used chunk-counted tokens because the server sent no
+usage object, so treat them as approximate.
 
 Each run's filler context is shuffled fresh, so no two requests share token
 prefixes long enough for server-side prompt or KV-cache reuse. That keeps

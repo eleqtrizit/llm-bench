@@ -195,7 +195,7 @@ class TestRunCompletion:
         lines.append(b"data: [DONE]")
         return io.BytesIO(b"\n".join(lines) + b"\n")
 
-    def test_measures_prefill_and_generation(self) -> None:
+    def test_measures_prefill_and_generation_from_usage(self) -> None:
         chunks = [
             {"choices": [{"delta": {"content": "He"}}]},
             {"choices": [{"delta": {"content": "llo"}}]},
@@ -203,24 +203,63 @@ class TestRunCompletion:
         ]
         resp = self._sse_body(chunks)
         with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
-            gen_tok_s, prefill_tok_s, prompt, gen, ttft = run_completion(
-                "http://host:1", "m", "hi", 8, 10
-            )
-        assert prompt == 600
-        assert gen == 2
-        assert ttft > 0
-        assert prefill_tok_s > 0
-        assert gen_tok_s > 0
+            r = run_completion("http://host:1", "m", "hi", 8, 10)
+        assert r.prompt_tok == 600
+        assert r.gen_tok == 2
+        assert r.ttft_s > 0
+        assert r.prefill_tok_s > 0
+        assert r.gen_tok_s > 0
+        assert r.source == "usage"
 
-    def test_no_usage_means_unknown_prefill(self) -> None:
-        chunks = [{"choices": [{"delta": {"content": "Hey"}}]}]
+    def test_reasoning_deltas_start_the_ttft_clock(self) -> None:
+        chunks = [
+            {"choices": [{"delta": {"reasoning": "think"}}]},
+            {"choices": [{"delta": {"content": "ans"}}]},
+            {"usage": {"prompt_tokens": 10, "completion_tokens": 2}},
+        ]
         resp = self._sse_body(chunks)
         with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
-            _g, prefill_tok_s, prompt, _n, _t = run_completion(
-                "http://host:1", "m", "hi", 8, 10
-            )
-        assert prompt == 0
-        assert prefill_tok_s == 0.0
+            r = run_completion("http://host:1", "m", "hi", 8, 10)
+        assert r.ttft_s > 0
+        assert r.gen_tok == 2
+        assert r.source == "usage"
+
+    def test_uses_llama_cpp_timings_when_present(self) -> None:
+        chunks = [
+            {"choices": [{"delta": {"content": "a"}}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 900, "completion_tokens": 50},
+                "timings": {
+                    "prompt_n": 1000,
+                    "prompt_ms": 100.0,
+                    "predicted_n": 50,
+                    "predicted_ms": 500.0,
+                },
+            },
+        ]
+        resp = self._sse_body(chunks)
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
+            r = run_completion("http://host:1", "m", "hi", 8, 10)
+        assert r.source == "timings"
+        assert r.prefill_tok_s == 1000 / 0.1
+        assert r.gen_tok_s == 50 / 0.5
+        assert r.prompt_tok == 1000
+        assert r.gen_tok == 50
+
+    def test_falls_back_to_chunk_count_and_flags_estimate(self) -> None:
+        chunks = [
+            {"choices": [{"delta": {"content": "a"}}]},
+            {"choices": [{"delta": {"content": "b"}}]},
+            {"choices": [{"delta": {"content": "c"}}]},
+        ]
+        resp = self._sse_body(chunks)
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
+            r = run_completion("http://host:1", "m", "hi", 8, 10)
+        assert r.source == "estimated"
+        assert r.gen_tok == 3
+        assert r.prompt_tok == 0
+        assert r.prefill_tok_s == 0.0
 
     def test_no_tokens_raises(self) -> None:
         resp = self._sse_body([])

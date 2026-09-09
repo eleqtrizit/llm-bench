@@ -8,6 +8,7 @@ Benchmarks generation throughput (tok/s) at prompt/context lengths of
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import random
 import sys
@@ -15,7 +16,7 @@ import termios
 import time
 import tty
 import urllib.request
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 DEFAULT_CTX_OPTIONS = [0, 8, 32, 64, 128, 200]
 TASKS: Dict[str, str] = {
@@ -70,14 +71,42 @@ def build_prompt(
     )
 
 
+@dataclass(frozen=True)
+class RunResult:
+    """Measured outcome of one streaming chat completion.
+
+    Attributes:
+        prefill_tok_s: Server-reported prefill throughput when available,
+            otherwise the TTFT-based estimate; 0.0 when unknowable.
+        gen_tok_s: Generation throughput, first token to last.
+        prompt_tok: Prompt tokens reported by the server, else 0.
+        gen_tok: Generated tokens, server count when available.
+        ttft_s: Client-measured time to first payload token.
+        source: Which mechanism produced the phase rates: ``timings`` for
+            llama.cpp-style server counters, ``usage`` for the TTFT-based
+            fallback, ``estimated`` when token counts were chunk-counted.
+    """
+
+    prefill_tok_s: float
+    gen_tok_s: float
+    prompt_tok: int
+    gen_tok: int
+    ttft_s: float
+    source: str
+
+
 def run_completion(
     base_url: str, model: str, prompt: str, gen_tokens: int, timeout: int
-) -> Tuple[float, float, int, int, float]:
+) -> RunResult:
     """Run a single streaming chat completion and time its phases.
 
-    The request streams server-sent events. Time-to-first-token bounds the
-    prefill phase, so prefill tok/s is estimated as ``prompt_tokens / TTFT``.
-    Generation tok/s counts only the time after the first token.
+    The request streams server-sent events. TTFT is the time to the first
+    payload token of any kind, including reasoning deltas from thinking
+    models. When the final chunk carries llama.cpp-style ``timings``, those
+    server-computed counters are used directly; otherwise prefill tok/s is
+    ``prompt_tokens / TTFT``. Token counts prefer the server's ``usage`` and
+    fall back to content-chunk counting, which is approximate because chunks
+    may carry several tokens.
 
     Args:
         base_url: Server root, for example ``http://127.0.0.1:8080``.
@@ -87,9 +116,7 @@ def run_completion(
         timeout: Request timeout in seconds.
 
     Returns:
-        A ``(gen_tok_s, prefill_tok_s, prompt_tokens, gen_tokens, ttft_s)``
-        tuple. ``prefill_tok_s`` is 0.0 when the server produced no prompt
-        token count.
+        A :class:`RunResult` with both phase rates and their provenance.
 
     Raises:
         RuntimeError: If the server responds but generates no tokens.
@@ -114,8 +141,8 @@ def run_completion(
     )
 
     n_chunk_tokens = 0
-    n_prompt = 0
-    n_gen = 0
+    usage: Dict[str, int] | None = None
+    timings: Dict[str, float] | None = None
     ttft = 0.0
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -131,26 +158,52 @@ def run_completion(
                 chunk = json.loads(data)
             except json.JSONDecodeError:
                 continue
-            usage = chunk.get("usage")
-            if usage:
-                n_prompt = usage.get("prompt_tokens", n_prompt)
-                n_gen = usage.get("completion_tokens", n_gen)
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            if chunk.get("timings"):
+                timings = chunk["timings"]
             for choice in chunk.get("choices", []):
-                delta = choice.get("delta", {})
-                if delta.get("content"):
+                delta = choice.get("delta") or {}
+                # Reasoning deltas stream before content on thinking models;
+                # both signal that prefill finished and generation began.
+                if delta.get("content") or delta.get("reasoning"):
                     n_chunk_tokens += 1
                     if ttft == 0.0:
                         ttft = time.perf_counter() - t0
     total = time.perf_counter() - t0
 
-    if n_gen <= 0:
-        n_gen = n_chunk_tokens
+    n_prompt_server = (usage or {}).get("prompt_tokens", 0)
+    n_gen_server = (usage or {}).get("completion_tokens", 0)
+
+    if timings and timings.get("prompt_n") and timings.get("prompt_ms"):
+        prompt_ms = float(timings["prompt_ms"])
+        prefill_tok_s = timings["prompt_n"] / (prompt_ms / 1000.0)
+        n_prompt = int(timings["prompt_n"])
+        if timings.get("predicted_n") and timings.get("predicted_ms"):
+            n_gen = int(timings["predicted_n"])
+            gen_tok_s = n_gen / (float(timings["predicted_ms"]) / 1000.0)
+        else:
+            n_gen = n_gen_server or n_chunk_tokens
+            gen_tok_s = n_gen / max(total - ttft, 1e-9)
+        source = "timings"
+    else:
+        n_gen = n_gen_server or n_chunk_tokens
+        n_prompt = n_prompt_server
+        gen_seconds = max(total - ttft, 1e-9)
+        gen_tok_s = n_gen / gen_seconds
+        prefill_tok_s = n_prompt / ttft if (n_prompt and ttft > 0) else 0.0
+        source = "usage" if n_gen_server else "estimated"
+
     if n_gen <= 0:
         raise RuntimeError("no tokens generated in streaming response")
-    gen_seconds = max(total - ttft, 1e-9)
-    gen_tok_s = n_gen / gen_seconds
-    prefill_tok_s = n_prompt / ttft if (n_prompt and ttft > 0) else 0.0
-    return gen_tok_s, prefill_tok_s, n_prompt, n_gen, ttft
+    return RunResult(
+        prefill_tok_s=prefill_tok_s,
+        gen_tok_s=gen_tok_s,
+        prompt_tok=n_prompt,
+        gen_tok=n_gen,
+        ttft_s=ttft,
+        source=source,
+    )
 
 
 def query_models(base_url: str, timeout: int) -> List[str]:
@@ -362,7 +415,7 @@ def menu_select_tasks() -> List[str] | None:
     if not sys.stdin.isatty():
         raise ValueError("no terminal attached; pass --task count,code,prose")
     chosen = menu_multi_select(
-        [f"{name} ({prompt})" for name, prompt in TASKS.items()],
+        [f"{name} ({prompt.rstrip('.')})" for name, prompt in TASKS.items()],
         "Select generation tasks (space: toggle, up/down: move,"
         " a: all/none, enter: start, q: quit)",
         allow_empty=False,
@@ -516,6 +569,7 @@ def format_row(
     gen_tok: int,
     prefill_tok_s: float,
     tok_s: float,
+    source: str = "usage",
 ) -> str:
     """Build one aligned results-table row.
 
@@ -526,6 +580,8 @@ def format_row(
         gen_tok: Completion tokens generated in this run.
         prefill_tok_s: Estimated prefill throughput; 0.0 means unknown.
         tok_s: Generation throughput of this run in tokens per second.
+        source: Provenance of the rates; ``estimated`` rows get an asterisk
+            on the throughput columns.
 
     Returns:
         The formatted row, aligned with the header columns. Unknown prefill
@@ -533,9 +589,14 @@ def format_row(
     """
     ctx_str = f"{ctx_k}k" if ctx_k else "0"
     prefill_str = f"{prefill_tok_s:.2f}" if prefill_tok_s > 0 else "-"
+    if source == "estimated":
+        prefill_str += "*"
+        tok_str = f"{tok_s:.2f}*"
+    else:
+        tok_str = f"{tok_s:.2f}"
     return (
         f"{ctx_str:>8} {task:<6} {prompt_tok:>13} {gen_tok:>10} "
-        f"{prefill_str:>16} {tok_s:>12.2f}"
+        f"{prefill_str:>16} {tok_str:>12}"
     )
 
 
@@ -564,13 +625,21 @@ def bench_lengths(
         for task in tasks:
             prompt = build_prompt(ctx, TASKS[task])
             try:
-                tok_s, prefill_tok_s, prompt_tok, g_tok, _ttft = run_completion(
-                    base_url, model, prompt, gen_tokens, timeout
-                )
+                result = run_completion(base_url, model, prompt, gen_tokens, timeout)
             except Exception as e:  # noqa: BLE001 - report and continue
                 print(f"{ctx:>8} {task:<6}   FAILED: {e}")
                 continue
-            print(format_row(ctx, task, prompt_tok, g_tok, prefill_tok_s, tok_s))
+            print(
+                format_row(
+                    ctx,
+                    task,
+                    result.prompt_tok,
+                    result.gen_tok,
+                    result.prefill_tok_s,
+                    result.gen_tok_s,
+                    result.source,
+                )
+            )
 
 
 def main(argv: List[str] | None = None) -> None:
