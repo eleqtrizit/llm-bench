@@ -546,9 +546,10 @@ def warm_up(base_url: str, model: str, timeout: int) -> None:
         RuntimeError: If any warmup completion generates no tokens.
         urllib.error.URLError: If the server is unreachable or times out.
     """
-    for i in range(WARMUP_PASSES):
+    print("Starting warm-up passes...")
+    for _ in range(WARMUP_PASSES):
         run_completion(base_url, model, WARMUP_PROMPT, WARMUP_GEN_TOKENS, timeout)
-        print(f"warmup pass {i + 1}/{WARMUP_PASSES} done")
+    print("Finished warm-ups.")
 
 
 def format_header() -> str:
