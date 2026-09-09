@@ -101,6 +101,57 @@ def run_completion(
     return n_gen / dt, n_prompt, n_gen, dt
 
 
+def query_models(base_url: str, timeout: int) -> List[str]:
+    """Query the server's served model list.
+
+    Args:
+        base_url: Server root, for example ``http://127.0.0.1:8080``.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        The model identifiers from ``GET /v1/models``, in served order.
+
+    Raises:
+        urllib.error.URLError: If the server is unreachable or times out.
+        RuntimeError: If the response has no models.
+    """
+    req = urllib.request.Request(base_url + "/v1/models", method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = json.loads(resp.read())
+    models = [m["id"] for m in body.get("data", []) if m.get("id")]
+    if not models:
+        raise RuntimeError(f"no models in /v1/models response: {body}")
+    return models
+
+
+def choose_model(models: List[str]) -> int:
+    """Render a numbered menu and read the user's model selection.
+
+    Args:
+        models: The model identifiers to choose from.
+
+    Returns:
+        The zero-based index of the chosen model, or -1 to quit.
+
+    Raises:
+        KeyboardInterrupt: If the user aborts with Ctrl-C.
+    """
+    print("\nAvailable models:")
+    for i, model in enumerate(models):
+        print(f"  [{i + 1}] {model}")
+    while True:
+        try:
+            raw = input(f"Select a model [1-{len(models)}] (q to quit): ").strip()
+        except EOFError:
+            print("\nNo model selected.")
+            return -1
+        if raw.lower() in ("q", "quit", "exit"):
+            return -1
+        if raw.isdigit() and 1 <= int(raw) <= len(models):
+            return int(raw) - 1
+        print(f"Invalid selection: {raw!r}. Enter a number between 1 and {len(models)}.")
+
+
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments.
 
@@ -117,7 +168,10 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         description="Benchmark tok/s on any OpenAI-compatible server.",
         add_help=False,
     )
-    ap.add_argument("--model", required=True, help="model name as served by the endpoint")
+    ap.add_argument(
+        "--model",
+        help="model name as served by the endpoint (omit to pick from /v1/models)",
+    )
     ap.add_argument("-h", "--host", required=True, help="server host")
     ap.add_argument("-p", "--port", required=True, type=int, help="server port")
     ap.add_argument(
@@ -239,12 +293,27 @@ def main(argv: List[str] | None = None) -> None:
     host = f"[{args.host}]" if ":" in args.host else args.host
     base_url = f"http://{host}:{args.port}"
 
+    model = args.model
+    if model is None:
+        try:
+            models = query_models(base_url, args.timeout)
+        except Exception as e:
+            raise SystemExit(f"error: cannot reach server at {base_url}: {e}") from e
+        if len(models) == 1:
+            model = models[0]
+            print(f"Only one model served, using: {model}")
+        else:
+            chosen = choose_model(models)
+            if chosen < 0:
+                raise SystemExit("No model selected; exiting.")
+            model = models[chosen]
+
     try:
-        run_completion(base_url, args.model, build_prompt(8), 8, args.timeout)
+        run_completion(base_url, model, build_prompt(8), 8, args.timeout)
     except Exception as e:
         raise SystemExit(f"error: cannot reach server at {base_url}: {e}") from e
 
-    print(f"llm-bench: {base_url}  model={args.model}")
+    print(f"llm-bench: {base_url}  model={model}")
     warmup_note = "(+warmup)" if not args.keep_warmup else ""
     print(f"gen_tokens={args.gen_tokens}  runs/length={args.runs} {warmup_note}")
     hdr = f"{'ctx':>5} {'prompt_tok':>10} {'gen_tok':>7} {'tok/s':>12} {'runs':>10}"
@@ -253,7 +322,7 @@ def main(argv: List[str] | None = None) -> None:
 
     results = bench_lengths(
         base_url,
-        args.model,
+        model,
         args.lengths,
         args.gen_tokens,
         args.runs,

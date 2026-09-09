@@ -1,8 +1,12 @@
 """Tests for llm_bench.spec_bench."""
 
+import io
+import json
+from unittest.mock import patch
+
 import pytest
 
-from llm_bench.spec_bench import build_prompt, parse_args, print_summary
+from llm_bench.spec_bench import build_prompt, choose_model, parse_args, print_summary, query_models
 
 
 class TestBuildPrompt:
@@ -48,6 +52,51 @@ class TestParseArgs:
             ["--model", "m", "--host", "10.0.0.5", "--port", "1", "--lengths", "4", "12"]
         )
         assert args.lengths == [4, 12]
+
+
+class TestQueryModels:
+    """query_models behavior."""
+
+    def _body(self, body: dict) -> io.BytesIO:
+        return io.BytesIO(json.dumps(body).encode())
+
+    def test_returns_model_ids(self) -> None:
+        resp = self._body({"data": [{"id": "a"}, {"id": "b"}]})
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
+            assert query_models("http://host:1", 10) == ["a", "b"]
+
+    def test_empty_model_list_raises(self) -> None:
+        resp = self._body({"data": []})
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
+            with pytest.raises(RuntimeError, match="no models"):
+                query_models("http://host:1", 10)
+
+
+class TestChooseModel:
+    """choose_model behavior."""
+
+    def test_selects_numbered_choice(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("builtins.input", lambda *_: "2")
+        assert choose_model(["a", "b"]) == 1
+
+    def test_retries_on_invalid_then_accepts(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        answers = iter(["nope", "1"])
+        monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+        assert choose_model(["a"]) == 0
+        assert "Invalid selection" in capsys.readouterr().out
+
+    def test_quit_flag_returns_minus_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("builtins.input", lambda *_: "q")
+        assert choose_model(["a", "b"]) == -1
+
+    def test_eof_returns_minus_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def raise_eof(*_: object) -> str:
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", raise_eof)
+        assert choose_model(["a"]) == -1
 
 
 class TestPrintSummary:

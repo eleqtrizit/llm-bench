@@ -26,11 +26,18 @@ uvx git+https://github.com/eleqtrizit/llm-bench --model <model> --host <host> --
 llm-bench --model qwen2.5-7b-instruct --host 127.0.0.1 --port 8080
 ```
 
+If you omit `--model`, the tool queries the server's `/v1/models` endpoint and
+shows a numbered menu to pick from:
+
+```bash
+llm-bench --host 127.0.0.1 --port 8080
+```
+
 Options:
 
 | Option | Description |
 | --- | --- |
-| `--model` | Model name as served by the endpoint (required) |
+| `--model` | Model name as served by the endpoint (optional; omit to pick interactively from `/v1/models`) |
 | `-h`, `--host` | Server host (required) |
 | `-p`, `--port` | Server port (required) |
 | `--lengths` | Context lengths to test (default `0 8 16 32 64 128`) |
