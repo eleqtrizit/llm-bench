@@ -1,5 +1,6 @@
 """Tests for llm_bench.spec_bench."""
 
+import argparse
 import io
 import json
 from unittest.mock import patch
@@ -13,7 +14,9 @@ from llm_bench.spec_bench import (
     choose_model,
     format_header,
     format_row,
+    menu_select_ctx,
     parse_args,
+    parse_ctx,
     print_summary,
     query_models,
     warm_up,
@@ -30,12 +33,17 @@ class TestBuildPrompt:
         assert build_prompt(-5) == "Count from 1 to 20."
 
     def test_larger_ctx_gives_longer_prompt(self) -> None:
-        short = build_prompt(8)
-        long = build_prompt(128)
+        short = build_prompt(1)
+        long = build_prompt(8)
         assert len(long) > len(short)
 
+    def test_kilotokens_scale_the_prompt(self) -> None:
+        one_k = len(build_prompt(1))
+        two_k = len(build_prompt(2))
+        assert abs(two_k / one_k - 2) < 0.1
+
     def test_prompt_mentions_task(self) -> None:
-        assert "count from 1 to 20" in build_prompt(64)
+        assert "count from 1 to 20" in build_prompt(1)
 
 
 class TestParseArgs:
@@ -56,11 +64,45 @@ class TestParseArgs:
         with pytest.raises(SystemExit):
             parse_args(["--port", "8080"])
 
-    def test_custom_lengths(self) -> None:
-        args = parse_args(
-            ["--model", "m", "--host", "10.0.0.5", "--port", "1", "--lengths", "4", "12"]
-        )
-        assert args.lengths == [4, 12]
+    def test_custom_ctx(self) -> None:
+        args = parse_args(["--model", "m", "--host", "h", "--port", "1", "--ctx", "0,8,16"])
+        assert args.ctx == [0, 8, 16]
+
+    def test_invalid_ctx_exits(self) -> None:
+        with pytest.raises(SystemExit):
+            parse_args(["--model", "m", "--host", "h", "--port", "1", "--ctx", "0,eight"])
+
+    def test_negative_ctx_exits(self) -> None:
+        with pytest.raises(SystemExit):
+            parse_args(["--model", "m", "--host", "h", "--port", "1", "--ctx", "-4"])
+
+
+class TestMenuSelectCtx:
+    """menu_select_ctx behavior."""
+
+    def test_requires_tty(self) -> None:
+        with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
+            fake_stdin.isatty.return_value = False
+            with pytest.raises(ValueError, match="no terminal"):
+                menu_select_ctx([0, 8])
+
+
+class TestParseCtx:
+    """parse_ctx behavior."""
+
+    def test_parses_comma_separated_values(self) -> None:
+        assert parse_ctx("0,8,16") == [0, 8, 16]
+
+    def test_whitespace_is_ignored(self) -> None:
+        assert parse_ctx("0, 8 ,16") == [0, 8, 16]
+
+    def test_rejects_non_numeric_values(self) -> None:
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_ctx("0,eight")
+
+    def test_rejects_negative_values(self) -> None:
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_ctx("0,-4")
 
 
 class TestQueryModels:
@@ -112,9 +154,9 @@ class TestTableFormatting:
     """format_header and format_row alignment behavior."""
 
     def test_row_has_four_columns(self) -> None:
-        row = format_row(128, 155, 81, 152.65)
+        row = format_row(8, 155, 81, 152.65)
         cols = row.split()
-        assert cols == ["128", "155", "81", "152.65"]
+        assert cols == ["8k", "155", "81", "152.65"]
 
     def test_tok_s_header_and_value_share_right_edge(self) -> None:
         header = format_header()

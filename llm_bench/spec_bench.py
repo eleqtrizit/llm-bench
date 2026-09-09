@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import termios
 import time
+import tty
 import urllib.request
 from typing import Dict, List, Tuple
 
-DEFAULT_LENGTHS = [0, 8, 16, 32, 64, 128]
+DEFAULT_CTX_OPTIONS = [0, 8, 32, 64, 128, 200]
 DEFAULT_GEN_TOKENS = 256
 DEFAULT_TIMEOUT = 600
 
@@ -25,18 +28,18 @@ FILLER = (
 )
 
 
-def build_prompt(ctx_tokens: int) -> str:
-    """Build a prompt with roughly ``ctx_tokens`` filler tokens.
+def build_prompt(ctx_k: int) -> str:
+    """Build a prompt with roughly ``ctx_k`` kilotokens of filler context.
 
     Args:
-        ctx_tokens: Approximate number of context tokens to pad the prompt with.
+        ctx_k: Context size in kilotokens; 0 produces a short prompt.
 
     Returns:
-        The prompt text, padded with filler words when ``ctx_tokens > 0``.
+        The prompt text, padded with filler words when ``ctx_k > 0``.
     """
-    if ctx_tokens <= 0:
+    if ctx_k <= 0:
         return "Count from 1 to 20."
-    n_words = max(1, int(ctx_tokens * 0.75))  # ~0.75 words per token
+    n_words = max(1, int(ctx_k * 1024 * 0.75))  # ~0.75 words per token
     filler = (FILLER * (n_words // len(FILLER.split()) + 1))[: n_words * 7]
     return (
         f"Read the following text carefully:\n\n{filler}\n\n"
@@ -150,6 +153,130 @@ def choose_model(models: List[str]) -> int:
         print(f"Invalid selection: {raw!r}. Enter a number between 1 and {len(models)}.")
 
 
+def read_key() -> str:
+    """Read one keypress in raw mode and map it to a menu action.
+
+    Returns:
+        One of ``up``, ``down``, ``space``, ``enter``, ``quit`` or the raw
+        lowercase character.
+
+    Raises:
+        KeyboardInterrupt: On Ctrl-C.
+    """
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            seq = sys.stdin.read(2)
+            return {"[A": "up", "[B": "down"}.get(seq, "")
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == " ":
+            return "space"
+        if ch in ("q", "\x03"):
+            return "quit"
+        return ch.lower()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def render_menu(options: List[int], selected: set[int], cursor: int, first: bool) -> str:
+    """Render the context-length selection menu.
+
+    Args:
+        options: The selectable context sizes, in kilotokens.
+        selected: Indices of currently toggled-on options.
+        cursor: Index of the option the cursor is on.
+        first: When True, render the header line too.
+
+    Returns:
+        The escape-sequence string to write to the terminal.
+    """
+    rows = []
+    if first:
+        rows.append(
+            "Select context lengths (space: toggle, up/down: move,"
+            " a: all/none, enter: start, q: quit)"
+        )
+    for i, opt in enumerate(options):
+        mark = "x" if i in selected else " "
+        pointer = ">" if i == cursor else " "
+        label = f"{opt}k" if opt else "0"
+        rows.append(f" {pointer} [{mark}] {label}")
+    # Move the cursor above the rendered rows and redraw them, erasing each line.
+    return "\x1b[s" + "".join(f"\r\x1b[2K{row}\n" for row in rows) + f"\x1b[{len(rows)}A"
+
+
+def menu_select_ctx(options: List[int]) -> List[int] | None:
+    """Show the interactive context-length multi-select menu.
+
+    All options start selected. Space toggles the option under the cursor,
+    ``a`` toggles all, enter confirms, and ``q`` aborts.
+
+    Args:
+        options: The selectable context sizes, in kilotokens.
+
+    Returns:
+        The chosen context sizes in kilotokens, or None when the user quits.
+
+    Raises:
+        ValueError: If not attached to a terminal.
+        KeyboardInterrupt: On Ctrl-C.
+    """
+    if not sys.stdin.isatty():
+        raise ValueError("no terminal attached; pass --ctx 0,8,... instead")
+    selected: set[int] = set(range(len(options)))
+    cursor = 0
+    print(render_menu(options, selected, cursor, True), end="", flush=True)
+    while True:
+        key = read_key()
+        if key == "quit":
+            print(f"\x1b[{len(options) + 1}B")
+            return None
+        if key == "enter":
+            print(f"\x1b[{len(options) + 1}B")
+            return [options[i] for i in sorted(selected)]
+        if key == "up":
+            cursor = (cursor - 1) % len(options)
+        elif key == "down":
+            cursor = (cursor + 1) % len(options)
+        elif key == "space":
+            if cursor in selected:
+                selected.remove(cursor)
+            else:
+                selected.add(cursor)
+        elif key == "a":
+            if len(selected) == len(options):
+                selected = set()
+            else:
+                selected = set(range(len(options)))
+        print(render_menu(options, selected, cursor, False), end="", flush=True)
+
+
+def parse_ctx(raw: str) -> List[int]:
+    """Parse a comma-separated ``--ctx`` value list.
+
+    Args:
+        raw: Comma-separated context sizes in kilotokens, for example
+            ``0,8,16``.
+
+    Returns:
+        The parsed context sizes, in kilotokens.
+
+    Raises:
+        argparse.ArgumentTypeError: If any value is not a non-negative integer.
+    """
+    try:
+        values = [int(v.strip()) for v in raw.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid --ctx value: {raw!r}") from None
+    if any(v < 0 for v in values):
+        raise argparse.ArgumentTypeError(f"--ctx values must be >= 0: {raw!r}")
+    return values
+
+
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments.
 
@@ -176,11 +303,12 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         "--help", action="help", default=argparse.SUPPRESS, help="show this help message and exit"
     )
     ap.add_argument(
-        "--lengths",
-        type=int,
-        nargs="+",
-        default=DEFAULT_LENGTHS,
-        help="context lengths to test (default: 0 8 16 32 64 128)",
+        "--ctx",
+        type=parse_ctx,
+        help=(
+            "comma-separated context sizes in kilotokens, for example 0,8,16"
+            " (omit to pick from an interactive menu)"
+        ),
     )
     ap.add_argument(
         "--gen-tokens",
@@ -228,11 +356,11 @@ def format_header() -> str:
     return f"{'ctx':>5} {'prompt_tok':>10} {'gen_tok':>7} {'tok/s':>9}"
 
 
-def format_row(ctx: int, prompt_tok: int, gen_tok: int, tok_s: float) -> str:
+def format_row(ctx_k: int, prompt_tok: int, gen_tok: int, tok_s: float) -> str:
     """Build one aligned results-table row.
 
     Args:
-        ctx: The context length of this row.
+        ctx_k: The context size of this row, in kilotokens.
         prompt_tok: Prompt tokens reported by the server for this run.
         gen_tok: Completion tokens generated in this run.
         tok_s: Generation throughput of this run in tokens per second.
@@ -240,7 +368,8 @@ def format_row(ctx: int, prompt_tok: int, gen_tok: int, tok_s: float) -> str:
     Returns:
         The formatted row, aligned with the header columns.
     """
-    return f"{ctx:>5} {prompt_tok:>10} {gen_tok:>7} {tok_s:>9.2f}"
+    ctx_str = f"{ctx_k}k" if ctx_k else "0"
+    return f"{ctx_str:>5} {prompt_tok:>10} {gen_tok:>7} {tok_s:>9.2f}"
 
 
 def bench_lengths(
@@ -250,17 +379,17 @@ def bench_lengths(
     gen_tokens: int,
     timeout: int,
 ) -> Dict[int, float]:
-    """Benchmark each context length once and print its result row.
+    """Benchmark each context size once and print its result row.
 
     Args:
         base_url: Server root, for example ``http://127.0.0.1:8080``.
         model: Model name as served by the endpoint.
-        lengths: Context lengths to test.
+        lengths: Context sizes to test, in kilotokens.
         gen_tokens: Maximum tokens to generate per run.
         timeout: Request timeout in seconds.
 
     Returns:
-        Mapping of context length to tok/s for lengths that completed
+        Mapping of context size to tok/s for sizes that completed
         successfully.
     """
     results: Dict[int, float] = {}
@@ -320,13 +449,24 @@ def main(argv: List[str] | None = None) -> None:
                 raise SystemExit("No model selected; exiting.")
             model = models[chosen]
 
+    lengths = args.ctx
+    if lengths is None:
+        try:
+            lengths = menu_select_ctx(DEFAULT_CTX_OPTIONS)
+        except ValueError as e:
+            raise SystemExit(f"error: {e}") from e
+        except KeyboardInterrupt:
+            raise SystemExit("cancelled.") from None
+        if lengths is None:
+            raise SystemExit("cancelled.")
+
     try:
         warm_up(base_url, model, args.timeout)
     except Exception as e:
         raise SystemExit(f"error: cannot reach server at {base_url}: {e}") from e
 
     print(f"llm-bench: {base_url}  model={model}")
-    print(f"gen_tokens={args.gen_tokens}, one run per context length")
+    print(f"gen_tokens={args.gen_tokens}, one run per context size")
     hdr = format_header()
     print("\n" + hdr)
     print("-" * len(hdr))
@@ -334,7 +474,7 @@ def main(argv: List[str] | None = None) -> None:
     results = bench_lengths(
         base_url,
         model,
-        args.lengths,
+        lengths,
         args.gen_tokens,
         args.timeout,
     )

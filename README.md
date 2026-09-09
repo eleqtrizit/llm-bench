@@ -63,6 +63,15 @@ shows a numbered menu to pick from:
 llm-bench --host 127.0.0.1 --port 8080
 ```
 
+If you omit `--ctx`, the tool shows a multi-select menu. Move with the arrow
+keys, toggle options with the spacebar, and press Enter to start. The preset
+options are 0, 8, 32, 64, 128, and 200 (kilotokens). Pass `--ctx` to skip the
+menu:
+
+```bash
+llm-bench --host 127.0.0.1 --port 8080 --ctx 0,8,16
+```
+
 Options:
 
 | Option | Description |
@@ -70,7 +79,7 @@ Options:
 | `--model` | Model name as served by the endpoint (optional; omit to pick interactively from `/v1/models`) |
 | `-h`, `--host` | Server host (required) |
 | `-p`, `--port` | Server port (required) |
-| `--lengths` | Context lengths to test (default `0 8 16 32 64 128`) |
+| `--ctx` | Comma-separated context sizes in kilotokens, for example `0,8,16` (optional; omit to pick from the interactive menu) |
 | `--gen-tokens` | Max tokens generated per run (default `256`) |
 | `--timeout` | Request timeout in seconds (default `600`) |
 
