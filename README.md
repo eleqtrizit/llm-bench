@@ -94,13 +94,11 @@ Example output:
 llm-bench: http://127.0.0.1:8080  model=qwen2.5-7b-instruct
 gen_tokens=256, one run per context size
 
-  ctx prompt_tok gen_tok prefill tok/s     tok/s
---------------------------------------------------
-    0         20      93              -    187.74
-   8k       6160     256        4520.31    178.40
+     ctx    prompt_tok    gen_tok    prefill tok/s        tok/s
+---------------------------------------------------------------
+       0            20         93                -       187.74
+      8k          6160        256          4520.31       178.40
 
-Summary (tok/s):
-  ctx=0    187.74 tok/s  |#####
 ```
 
 ## Development

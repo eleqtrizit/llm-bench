@@ -17,7 +17,6 @@ from llm_bench.spec_bench import (
     menu_select_ctx,
     parse_args,
     parse_ctx,
-    print_summary,
     query_models,
     run_completion,
     warm_up,
@@ -231,21 +230,3 @@ class TestWarmUp:
         assert len(calls) == 2
         assert all(p == WARMUP_PROMPT for p, _g in calls)
         assert all(g == WARMUP_GEN_TOKENS for _p, g in calls)
-
-
-class TestPrintSummary:
-    """print_summary behavior."""
-
-    def test_skips_when_single_result(self, capsys: pytest.CaptureFixture) -> None:
-        print_summary({0: 10.0})
-        assert capsys.readouterr().out == ""
-
-    def test_prints_bars_for_multiple_results(
-        self, capsys: pytest.CaptureFixture
-    ) -> None:
-        results = {0: 10.0, 8: 20.0}
-        print_summary(results)
-        out = capsys.readouterr().out
-        assert "Summary (tok/s):" in out
-        assert "ctx=0" in out and "ctx=8" in out
-        assert "#####" in out  # 20.0 / 2 = 10 hashes

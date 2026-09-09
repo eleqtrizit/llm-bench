@@ -14,7 +14,7 @@ import termios
 import time
 import tty
 import urllib.request
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 DEFAULT_CTX_OPTIONS = [0, 8, 32, 64, 128, 200]
 DEFAULT_GEN_TOKENS = 256
@@ -416,7 +416,7 @@ def bench_lengths(
     lengths: List[int],
     gen_tokens: int,
     timeout: int,
-) -> Dict[int, float]:
+) -> None:
     """Benchmark each context size once and print its result row.
 
     Args:
@@ -427,10 +427,8 @@ def bench_lengths(
         timeout: Request timeout in seconds.
 
     Returns:
-        Mapping of context size to tok/s for sizes that completed
-        successfully.
+        None. Each completed size is printed as one table row.
     """
-    results: Dict[int, float] = {}
     for ctx in lengths:
         prompt = build_prompt(ctx)
         try:
@@ -440,23 +438,7 @@ def bench_lengths(
         except Exception as e:  # noqa: BLE001 - report and continue
             print(f"{ctx:>8}   FAILED: {e}")
             continue
-        results[ctx] = tok_s
         print(format_row(ctx, prompt_tok, g_tok, prefill_tok_s, tok_s))
-    return results
-
-
-def print_summary(results: Dict[int, float]) -> None:
-    """Print a token-per-second summary with bar chart.
-
-    Args:
-        results: Mapping of context length to tok/s.
-    """
-    if len(results) <= 1:
-        return
-    print("\nSummary (tok/s):")
-    for ctx, tok_s in results.items():
-        bar = "#" * int(tok_s / 2)
-        print(f"  ctx={ctx:<4} {tok_s:8.2f} tok/s  |{bar}")
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -509,14 +491,13 @@ def main(argv: List[str] | None = None) -> None:
     print("\n" + hdr)
     print("-" * len(hdr))
 
-    results = bench_lengths(
+    bench_lengths(
         base_url,
         model,
         lengths,
         args.gen_tokens,
         args.timeout,
     )
-    print_summary(results)
 
 
 if __name__ == "__main__":
