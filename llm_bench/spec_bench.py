@@ -18,7 +18,6 @@ DEFAULT_LENGTHS = [0, 8, 16, 32, 64, 128]
 DEFAULT_GEN_TOKENS = 256
 DEFAULT_RUNS = 3
 DEFAULT_TIMEOUT = 600
-DEFAULT_IP = "127.0.0.1"
 
 # Filler words used to build context (the token count is only approximate,
 # which is fine: we report the server's own usage.prompt_tokens).
@@ -111,13 +110,19 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     Returns:
         The parsed argparse namespace.
     """
+    # We reclaim -h for --host, so the automatic -h/--help pair is disabled and
+    # help is re-added under the long form only.
     ap = argparse.ArgumentParser(
         prog="llm-bench",
         description="Benchmark tok/s on any OpenAI-compatible server.",
+        add_help=False,
     )
     ap.add_argument("--model", required=True, help="model name as served by the endpoint")
-    ap.add_argument("--ip", default=DEFAULT_IP, help=f"server IP (default {DEFAULT_IP})")
-    ap.add_argument("--port", required=True, type=int, help="server port")
+    ap.add_argument("-h", "--host", required=True, help="server host")
+    ap.add_argument("-p", "--port", required=True, type=int, help="server port")
+    ap.add_argument(
+        "--help", action="help", default=argparse.SUPPRESS, help="show this help message and exit"
+    )
     ap.add_argument(
         "--lengths",
         type=int,
@@ -231,7 +236,8 @@ def main(argv: List[str] | None = None) -> None:
         SystemExit: If the server cannot be reached.
     """
     args = parse_args(argv)
-    base_url = f"http://{args.ip}:{args.port}"
+    host = f"[{args.host}]" if ":" in args.host else args.host
+    base_url = f"http://{host}:{args.port}"
 
     try:
         run_completion(base_url, args.model, build_prompt(8), 8, args.timeout)

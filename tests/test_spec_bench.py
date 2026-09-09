@@ -27,20 +27,26 @@ class TestParseArgs:
     """parse_args behavior."""
 
     def test_required_args(self) -> None:
-        args = parse_args(["--model", "m", "--port", "8080"])
+        args = parse_args(["--model", "m", "--host", "10.0.0.5", "--port", "8080"])
         assert args.model == "m"
+        assert args.host == "10.0.0.5"
         assert args.port == 8080
-        assert args.ip == "127.0.0.1"
         assert args.gen_tokens == 256
         assert args.runs == 3
         assert not args.keep_warmup
+
+    def test_missing_host_exits(self) -> None:
+        with pytest.raises(SystemExit):
+            parse_args(["--model", "m", "--port", "8080"])
 
     def test_missing_model_exits(self) -> None:
         with pytest.raises(SystemExit):
             parse_args(["--port", "8080"])
 
     def test_custom_lengths(self) -> None:
-        args = parse_args(["--model", "m", "--port", "1", "--lengths", "4", "12"])
+        args = parse_args(
+            ["--model", "m", "--host", "10.0.0.5", "--port", "1", "--lengths", "4", "12"]
+        )
         assert args.lengths == [4, 12]
 
 

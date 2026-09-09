@@ -5,7 +5,7 @@ Benchmark token generation throughput (tok/s) on any OpenAI-compatible server, a
 ## Install as a global CLI
 
 ```bash
-uv tool install git+https://github.com/your-user/llm-bench
+uv tool install git+https://github.com/eleqtrizit/llm-bench
 ```
 
 Or from a local checkout:
@@ -14,16 +14,16 @@ Or from a local checkout:
 uv tool install .
 ```
 
-This puts `llm-spec-bench` on your PATH. You can also run it without installing:
+This puts `llm-bench` on your PATH. You can also run it without installing:
 
 ```bash
-uvx git+https://github.com/your-user/llm-bench --model <model> --port <port>
+uvx git+https://github.com/eleqtrizit/llm-bench --model <model> --host <host> --port <port>
 ```
 
 ## Usage
 
 ```bash
-llm-spec-bench --model qwen2.5-7b-instruct --ip 127.0.0.1 --port 8080
+llm-bench --model qwen2.5-7b-instruct --host 127.0.0.1 --port 8080
 ```
 
 Options:
@@ -31,8 +31,8 @@ Options:
 | Option | Description |
 | --- | --- |
 | `--model` | Model name as served by the endpoint (required) |
-| `--ip` | Server IP (default `127.0.0.1`) |
-| `--port` | Server port (required) |
+| `-h`, `--host` | Server host (required) |
+| `-p`, `--port` | Server port (required) |
 | `--lengths` | Context lengths to test (default `0 8 16 32 64 128`) |
 | `--gen-tokens` | Max tokens generated per run (default `256`) |
 | `--runs` | Runs per length (default `3`; first run is a discarded warmup) |
@@ -42,7 +42,7 @@ Options:
 Example output:
 
 ```text
-llm-spec-bench: http://127.0.0.1:8080  model=qwen2.5-7b-instruct
+llm-bench: http://127.0.0.1:8080  model=qwen2.5-7b-instruct
 
   ctx prompt_tok gen_tok        tok/s       runs
 --------------------------------------------------
