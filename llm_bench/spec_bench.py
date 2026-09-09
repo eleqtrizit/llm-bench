@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import termios
 import time
@@ -28,19 +29,32 @@ FILLER = (
 )
 
 
-def build_prompt(ctx_k: int) -> str:
+def build_prompt(ctx_k: int, rng: random.Random | None = None) -> str:
     """Build a prompt with roughly ``ctx_k`` kilotokens of filler context.
+
+    The filler is drawn from ``FILLER`` but shuffled fresh on every call, and
+    the shuffled order is unique per call. This keeps every measured prompt
+    from sharing token-block prefixes with any other request, which prevents
+    server-side prompt and KV-cache reuse from inflating the prefill numbers.
 
     Args:
         ctx_k: Context size in kilotokens; 0 produces a short prompt.
+        rng: Optional seeded random source for deterministic prompts in tests.
 
     Returns:
-        The prompt text, padded with filler words when ``ctx_k > 0``.
+        The prompt text, padded with shuffled filler words when ``ctx_k > 0``.
     """
     if ctx_k <= 0:
         return "Count from 1 to 20."
+    rng = rng if rng is not None else random.Random()
+    pool = FILLER.split()
     n_words = max(1, int(ctx_k * 1024 * 0.75))  # ~0.75 words per token
-    filler = (FILLER * (n_words // len(FILLER.split()) + 1))[: n_words * 7]
+    words: List[str] = []
+    while len(words) < n_words:
+        batch = pool[:]
+        rng.shuffle(batch)
+        words.extend(batch)
+    filler = " ".join(words[:n_words])
     return (
         f"Read the following text carefully:\n\n{filler}\n\n"
         "Now, ignoring the text above entirely, count from 1 to 20."

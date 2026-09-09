@@ -45,6 +45,15 @@ class TestBuildPrompt:
     def test_prompt_mentions_task(self) -> None:
         assert "count from 1 to 20" in build_prompt(1)
 
+    def test_prompts_are_unique_per_call(self) -> None:
+        assert build_prompt(8) != build_prompt(8)
+
+    def test_seeded_prompts_are_deterministic(self) -> None:
+        import random
+
+        rng = random.Random(42)
+        assert build_prompt(1, rng) == build_prompt(1, random.Random(42))
+
 
 class TestParseArgs:
     """parse_args behavior."""

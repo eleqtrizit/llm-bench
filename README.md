@@ -57,6 +57,10 @@ phase, so prefill tok/s is estimated as `prompt_tokens / TTFT`. Generation
 tok/s counts only the time after the first token. A dash in the prefill
 column means the server reported no prompt token count.
 
+Each run's filler context is shuffled fresh, so no two requests share token
+prefixes long enough for server-side prompt or KV-cache reuse. That keeps
+cache hits from inflating the prefill numbers.
+
 ```bash
 llm-bench --model qwen2.5-7b-instruct --host 127.0.0.1 --port 8080
 ```
