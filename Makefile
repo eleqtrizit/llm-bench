@@ -32,4 +32,4 @@ clean:  ## Clean build artifacts
 
 
 run:  ## Run the benchmark CLI
-	uv run llm-spec-bench
+	uv run llm-bench

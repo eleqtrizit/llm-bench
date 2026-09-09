@@ -2,38 +2,28 @@
 
 Benchmark token generation throughput (tok/s) on any OpenAI-compatible server, across prompt/context lengths.
 
-## Quick Start
-
-Install the CLI globally:
+## Install as a global CLI
 
 ```bash
-uv tool install git+https://github.com/eleqtrizit/llm-bench
+uv tool install git+https://github.com/your-user/llm-bench
 ```
 
-Then run it against any OpenAI-compatible server:
-
-```bash
-llm-bench --model <model> --port <port>
-```
-
-## Run without installing
-
-From a local checkout:
+Or from a local checkout:
 
 ```bash
 uv tool install .
 ```
 
-Or run directly from the repo:
+This puts `llm-spec-bench` on your PATH. You can also run it without installing:
 
 ```bash
-uvx git+https://github.com/eleqtrizit/llm-bench --model <model> --port <port>
+uvx git+https://github.com/your-user/llm-bench --model <model> --port <port>
 ```
 
 ## Usage
 
 ```bash
-llm-bench --model qwen2.5-7b-instruct --ip 127.0.0.1 --port 8080
+llm-spec-bench --model qwen2.5-7b-instruct --ip 127.0.0.1 --port 8080
 ```
 
 Options:
@@ -52,7 +42,7 @@ Options:
 Example output:
 
 ```text
-llm-bench: http://127.0.0.1:8080  model=qwen2.5-7b-instruct
+llm-spec-bench: http://127.0.0.1:8080  model=qwen2.5-7b-instruct
 
   ctx prompt_tok gen_tok        tok/s       runs
 --------------------------------------------------
@@ -69,10 +59,3 @@ make lint      # compileall + flake8 + mypy
 make format    # autopep8
 make run       # run the CLI in the venv
 ```
-
-## Uninstall
-
-```bash
-uv tool uninstall llm-bench
-```
-

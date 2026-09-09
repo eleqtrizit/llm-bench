@@ -8,7 +8,7 @@ license = { text = "MIT" }
 dependencies = []
 
 [project.scripts]
-llm-spec-bench = "llm_bench.spec_bench:main"
+llm-bench = "llm_bench.spec_bench:main"
 
 [build-system]
 requires = ["setuptools"]

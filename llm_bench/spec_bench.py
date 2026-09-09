@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""llm-spec-bench: benchmark tok/s on any OpenAI-compatible server.
+"""llm-bench: benchmark tok/s on any OpenAI-compatible server.
 
 Benchmarks generation throughput (tok/s) at prompt/context lengths of
 0, 8, 16, 32, 64 and 128 tokens (or override with ``--lengths``).
@@ -112,7 +112,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         The parsed argparse namespace.
     """
     ap = argparse.ArgumentParser(
-        prog="llm-spec-bench",
+        prog="llm-bench",
         description="Benchmark tok/s on any OpenAI-compatible server.",
     )
     ap.add_argument("--model", required=True, help="model name as served by the endpoint")
@@ -238,7 +238,7 @@ def main(argv: List[str] | None = None) -> None:
     except Exception as e:
         raise SystemExit(f"error: cannot reach server at {base_url}: {e}") from e
 
-    print(f"llm-spec-bench: {base_url}  model={args.model}")
+    print(f"llm-bench: {base_url}  model={args.model}")
     warmup_note = "(+warmup)" if not args.keep_warmup else ""
     print(f"gen_tokens={args.gen_tokens}  runs/length={args.runs} {warmup_note}")
     hdr = f"{'ctx':>5} {'prompt_tok':>10} {'gen_tok':>7} {'tok/s':>12} {'runs':>10}"
