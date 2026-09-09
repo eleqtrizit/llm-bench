@@ -7,6 +7,8 @@ from unittest.mock import patch
 import pytest
 
 from llm_bench.spec_bench import (
+    WARMUP_GEN_TOKENS,
+    WARMUP_PROMPT,
     build_prompt,
     choose_model,
     format_header,
@@ -14,6 +16,7 @@ from llm_bench.spec_bench import (
     parse_args,
     print_summary,
     query_models,
+    warm_up,
 )
 
 
@@ -120,6 +123,25 @@ class TestTableFormatting:
         header_end = header.index("tok/s") + len("tok/s")
         row_end = row.index("191.65") + len("191.65")
         assert header_end == row_end
+
+
+class TestWarmUp:
+    """warm_up behavior."""
+
+    def test_runs_two_short_passes(self) -> None:
+        calls = []
+
+        def fake_completion(
+            base_url: str, model: str, prompt: str, gen_tokens: int, timeout: int
+        ) -> tuple[float, int, int, float]:
+            calls.append((prompt, gen_tokens))
+            return 1.0, 2, 3, 4.0
+
+        with patch("llm_bench.spec_bench.run_completion", side_effect=fake_completion):
+            warm_up("http://host:1", "m", 10)
+        assert len(calls) == 2
+        assert all(p == WARMUP_PROMPT for p, _g in calls)
+        assert all(g == WARMUP_GEN_TOKENS for _p, g in calls)
 
 
 class TestPrintSummary:

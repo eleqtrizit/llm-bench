@@ -194,6 +194,31 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+WARMUP_PROMPT = "Say hello and nothing else."
+WARMUP_GEN_TOKENS = 16
+WARMUP_PASSES = 2
+
+
+def warm_up(base_url: str, model: str, timeout: int) -> None:
+    """Run short warmup completions so the server has the model loaded.
+
+    Two tiny zero-context requests prime any lazy model loading or cache
+    setup before measured runs begin.
+
+    Args:
+        base_url: Server root, for example ``http://127.0.0.1:8080``.
+        model: Model name as served by the endpoint.
+        timeout: Request timeout in seconds.
+
+    Raises:
+        RuntimeError: If any warmup completion generates no tokens.
+        urllib.error.URLError: If the server is unreachable or times out.
+    """
+    for i in range(WARMUP_PASSES):
+        run_completion(base_url, model, WARMUP_PROMPT, WARMUP_GEN_TOKENS, timeout)
+        print(f"warmup pass {i + 1}/{WARMUP_PASSES} done")
+
+
 def format_header() -> str:
     """Build the aligned header row for the per-length results table.
 
@@ -296,7 +321,7 @@ def main(argv: List[str] | None = None) -> None:
             model = models[chosen]
 
     try:
-        run_completion(base_url, model, build_prompt(8), 8, args.timeout)
+        warm_up(base_url, model, args.timeout)
     except Exception as e:
         raise SystemExit(f"error: cannot reach server at {base_url}: {e}") from e
 

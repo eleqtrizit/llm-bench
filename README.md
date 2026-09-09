@@ -49,6 +49,9 @@ uvx git+https://github.com/eleqtrizit/llm-bench --model <model> --host <host> --
 
 ## Usage
 
+Before measuring, the tool sends two short zero-context warmup requests so the
+server has the model fully loaded.
+
 ```bash
 llm-bench --model qwen2.5-7b-instruct --host 127.0.0.1 --port 8080
 ```
