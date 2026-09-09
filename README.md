@@ -2,6 +2,20 @@
 
 Benchmark token generation throughput (tok/s) on any OpenAI-compatible server, across prompt/context lengths.
 
+## Quick Start
+
+Install the CLI globally:
+
+```bash
+uv tool install git+https://github.com/eleqtrizit/llm-bench
+```
+
+Then run it against any OpenAI-compatible server:
+
+```bash
+llm-bench --model <model> --host <host> --port <port>
+```
+
 ## Install as a global CLI
 
 ```bash
@@ -12,6 +26,19 @@ Or from a local checkout:
 
 ```bash
 uv tool install .
+```
+
+To upgrade an existing install to the latest version:
+
+```bash
+uv tool upgrade llm-bench
+```
+
+If the upgrade does not pick up changes, uninstall and reinstall:
+
+```bash
+uv tool uninstall llm-bench
+uv tool install git+https://github.com/eleqtrizit/llm-bench
 ```
 
 This puts `llm-bench` on your PATH. You can also run it without installing:
@@ -65,4 +92,10 @@ make test      # pytest
 make lint      # compileall + flake8 + mypy
 make format    # autopep8
 make run       # run the CLI in the venv
+```
+
+## Uninstall
+
+```bash
+uv tool uninstall llm-bench
 ```
