@@ -68,7 +68,7 @@ class TestParseArgs:
         assert args.model == "m"
         assert args.host == "10.0.0.5"
         assert args.port == 8080
-        assert args.gen_tokens == 256
+        assert args.gen_tokens == 2048
 
     def test_missing_host_exits(self) -> None:
         with pytest.raises(SystemExit):

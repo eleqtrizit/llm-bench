@@ -23,7 +23,7 @@ TASKS: Dict[str, str] = {
     "code": "Write a Python Snake game.",
     "prose": "Write me a poem about Agents and LLMs.",
 }
-DEFAULT_GEN_TOKENS = 256
+DEFAULT_GEN_TOKENS = 2048
 DEFAULT_TIMEOUT = 600
 
 # Filler words used to build context (the token count is only approximate,

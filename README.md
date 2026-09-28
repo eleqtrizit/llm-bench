@@ -101,18 +101,18 @@ Options:
 | `-p`, `--port` | Server port (required) |
 | `--ctx` | Comma-separated context sizes in kilotokens, for example `0,8,16` (optional; omit to pick from the interactive menu) |
 | `--task` | Comma-separated generation tasks (`code`, `prose`; optional; omit to pick from the interactive menu) |
-| `--gen-tokens` | Max tokens generated per run (default `256`) |
+| `--gen-tokens` | Max tokens generated per run (default `2048`) |
 | `--timeout` | Request timeout in seconds (default `600`) |
 
 Example output:
 
 ```text
 llm-bench: http://127.0.0.1:8080  model=qwen2.5-7b-instruct
-gen_tokens=256, one run per context size
+gen_tokens=2048, one run per context size
 
      ctx task      prompt_tok    gen_tok    prefill tok/s        tok/s
 ----------------------------------------------------------------------
-      8k code            6160        256          4520.31       178.40
+      8k code            6160       2048          4520.31       178.40
       8k prose           6201        180          4108.83       165.12
 
 ```
