@@ -15,10 +15,32 @@ import sys
 import termios
 import time
 import tty
+import urllib.error
 import urllib.request
 from typing import Dict, List
 
 DEFAULT_CTX_OPTIONS = [0, 8, 32, 64, 128, 200]
+
+# SGLang Prometheus metrics used for server-reported throughput numbers. The
+# bench snapshots /metrics before and after each single-request run and reads
+# the deltas, so every number comes from the server's own accounting.
+METRIC_PROMPT_TOKENS = "sglang:prompt_tokens_total"
+METRIC_GEN_TOKENS = "sglang:generation_tokens_total"
+METRIC_TTFT_SUM = "sglang:time_to_first_token_seconds_sum"
+METRIC_TTFT_COUNT = "sglang:time_to_first_token_seconds_count"
+METRIC_E2E_SUM = "sglang:e2e_request_latency_seconds_sum"
+METRIC_E2E_COUNT = "sglang:e2e_request_latency_seconds_count"
+REQUIRED_METRICS = (
+    METRIC_PROMPT_TOKENS,
+    METRIC_GEN_TOKENS,
+    METRIC_TTFT_SUM,
+    METRIC_TTFT_COUNT,
+    METRIC_E2E_SUM,
+    METRIC_E2E_COUNT,
+)
+METRICS_POLL_INTERVAL_S = 0.5
+METRICS_POLL_DEADLINE_S = 10.0
+METRICS_SNAPSHOT_RETRIES = 5
 TASKS: Dict[str, str] = {
     "code": "Write a Python Snake game.",
     "prose": "Write me a poem about Agents and LLMs.",
@@ -83,7 +105,8 @@ class RunResult:
         ttft_s: Client-measured time to first payload token.
         source: Which mechanism produced the phase rates: ``timings`` for
             llama.cpp-style server counters, ``usage`` for the TTFT-based
-            fallback, ``estimated`` when token counts were chunk-counted.
+            fallback, ``estimated`` when token counts were chunk-counted,
+            ``sglang`` when the rates came from SGLang /metrics deltas.
     """
 
     prefill_tok_s: float
@@ -203,6 +226,181 @@ def run_completion(
         ttft_s=ttft,
         source=source,
     )
+
+
+def parse_metrics_text(text: str) -> Dict[str, float]:
+    """Parse a Prometheus exposition document into a metric-name sum map.
+
+    Labeled series such as ``metric{a="b"} 1.0`` are aggregated by base metric
+    name: counters, ``_sum`` and ``_count`` series add up, so streaming and
+    non-streaming series of the same histogram collapse into one value. Bucket
+    series are dropped because the deltas the bench needs never read them.
+
+    Args:
+        text: The raw ``/metrics`` response body.
+
+    Returns:
+        A mapping from base metric name (for example
+        ``sglang:time_to_first_token_seconds_sum``) to the summed value.
+    """
+    values: Dict[str, float] = {}
+    for line in text.splitlines():
+        if not line.startswith("sglang:") or line.startswith("#"):
+            continue
+        name, _, raw_value = line.rpartition(" ")
+        key = name.split("{")[0]
+        if key.endswith("_bucket"):
+            continue
+        try:
+            values[key] = values.get(key, 0.0) + float(raw_value)
+        except ValueError:
+            continue
+    return values
+
+
+def snapshot_server_metrics(
+    base_url: str, timeout: int, required: tuple[str, ...] = REQUIRED_METRICS
+) -> Dict[str, float]:
+    """Fetch and parse ``/metrics``, retrying until every required name appears.
+
+    SGLang can serve a truncated or partially flushed scrape while a busy
+    scheduler updates its histograms, so a missing required name triggers a
+    short retry instead of trusting a partial snapshot.
+
+    Args:
+        base_url: Server root, for example ``http://127.0.0.1:8080``.
+        timeout: Per-request timeout in seconds.
+        required: Metric names that must be present in the snapshot.
+
+    Returns:
+        The parsed metric map.
+
+    Raises:
+        RuntimeError: If the endpoint never yields all required metrics.
+        urllib.error.URLError: If the server is unreachable or times out.
+    """
+    last_error: Exception | None = None
+    for _ in range(METRICS_SNAPSHOT_RETRIES):
+        try:
+            with urllib.request.urlopen(base_url + "/metrics", timeout=timeout) as resp:
+                values = parse_metrics_text(resp.read().decode())
+            missing = [name for name in required if name not in values]
+            if not missing:
+                return values
+            last_error = RuntimeError(f"/metrics is missing {', '.join(missing)}")
+        except urllib.error.URLError:
+            raise
+        except Exception as e:  # noqa: BLE001 - retry transient scrape failures
+            last_error = e
+        time.sleep(METRICS_POLL_INTERVAL_S)
+    raise RuntimeError(f"cannot read /metrics after retries: {last_error}")
+
+
+def diff_metrics(
+    before: Dict[str, float], after: Dict[str, float]
+) -> Dict[str, float]:
+    """Compute per-metric deltas between two snapshots.
+
+    Args:
+        before: The pre-run snapshot.
+        after: The post-run snapshot.
+
+    Returns:
+        A mapping from metric name to ``after - before`` for every metric
+        present in ``after``; names only in ``before`` are ignored.
+    """
+    return {k: v - before[k] for k, v in after.items() if k in before}
+
+
+def metrics_to_rates(
+    deltas: Dict[str, float], client_result: "RunResult"
+) -> "RunResult | None":
+    """Turn single-request metric deltas into server-measured rates.
+
+    The design assumes exactly one request ran between the snapshots, so each
+    histogram ``_count`` must have advanced by exactly one. Anything else
+    (concurrent traffic, missing deltas, non-positive timings) returns None so
+    the caller can fall back to client-side estimates.
+
+    Args:
+        deltas: Metric deltas from :func:`diff_metrics`.
+        client_result: The client-measured result, reused for token counts
+            whenever a server delta is unavailable.
+
+    Returns:
+        A :class:`RunResult` with ``source == "sglang"``, or None when the
+        deltas do not describe exactly one clean request.
+    """
+    ttft_count = deltas.get(METRIC_TTFT_COUNT, 0.0)
+    e2e_count = deltas.get(METRIC_E2E_COUNT, 0.0)
+    ttft = deltas.get(METRIC_TTFT_SUM, 0.0)
+    e2e = deltas.get(METRIC_E2E_SUM, 0.0)
+    prompt_tok = deltas.get(METRIC_PROMPT_TOKENS, 0.0)
+    gen_tok = deltas.get(METRIC_GEN_TOKENS, 0.0)
+    if ttft_count != 1 or e2e_count != 1 or ttft <= 0 or e2e <= ttft:
+        return None
+    decode_seconds = e2e - ttft
+    return RunResult(
+        prefill_tok_s=prompt_tok / ttft if prompt_tok > 0 else 0.0,
+        gen_tok_s=gen_tok / decode_seconds if gen_tok > 0 else 0.0,
+        prompt_tok=int(prompt_tok or client_result.prompt_tok),
+        gen_tok=int(gen_tok or client_result.gen_tok),
+        ttft_s=client_result.ttft_s,
+        source="sglang",
+    )
+
+
+def run_completion_measured(
+    base_url: str, model: str, prompt: str, gen_tokens: int, timeout: int
+) -> RunResult:
+    """Run one completion and report throughput from SGLang server metrics.
+
+    A ``/metrics`` snapshot is taken before and after the request. When the
+    server exposes the SGLang counters and the deltas describe exactly one
+    request, prefill and decode tok/s come from the server's own TTFT and
+    end-to-end latency accounting. Otherwise the client-measured result from
+    :func:`run_completion` is returned unchanged.
+
+    Args:
+        base_url: Server root, for example ``http://127.0.0.1:8080``.
+        model: Model name as served by the endpoint.
+        prompt: The user prompt text.
+        gen_tokens: Maximum tokens to generate.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        A :class:`RunResult`; ``source`` is ``sglang`` when server metrics
+        were used, otherwise the provenance recorded by the client fallback.
+
+    Raises:
+        RuntimeError: If the server generates no tokens.
+        urllib.error.URLError: If the server is unreachable or times out.
+    """
+    metrics_unavailable: Exception | None = None
+    before: Dict[str, float] | None = None
+    try:
+        before = snapshot_server_metrics(base_url, timeout)
+    except (RuntimeError, urllib.error.URLError) as e:
+        if isinstance(e, urllib.error.URLError):
+            raise
+        metrics_unavailable = e
+
+    result = run_completion(base_url, model, prompt, gen_tokens, timeout)
+    if before is None:
+        if metrics_unavailable is not None:
+            print(f"  (server metrics unavailable, using client timing: {metrics_unavailable})")
+        return result
+
+    deadline = time.monotonic() + METRICS_POLL_DEADLINE_S
+    while True:
+        after = snapshot_server_metrics(base_url, timeout)
+        rates = metrics_to_rates(diff_metrics(before, after), result)
+        if rates is not None:
+            return rates
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(METRICS_POLL_INTERVAL_S)
+    return result
 
 
 def query_models(base_url: str, timeout: int) -> List[str]:
@@ -626,7 +824,9 @@ def bench_lengths(
         for task in tasks:
             prompt = build_prompt(ctx, TASKS[task])
             try:
-                result = run_completion(base_url, model, prompt, gen_tokens, timeout)
+                result = run_completion_measured(
+                    base_url, model, prompt, gen_tokens, timeout
+                )
             except Exception as e:  # noqa: BLE001 - report and continue
                 print(f"{ctx:>8} {task:<6}   FAILED: {e}")
                 continue
@@ -699,6 +899,10 @@ def main(argv: List[str] | None = None) -> None:
         raise SystemExit(f"error: cannot reach server at {base_url}: {e}") from e
 
     print(f"llm-bench: {base_url}  model={model}")
+    print(
+        "throughput numbers come from the SGLang server's own /metrics"
+        " when available; client timing is the fallback"
+    )
     print(f"gen_tokens={args.gen_tokens}, one run per context size")
     hdr = format_header()
     print("\n" + hdr)

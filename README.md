@@ -52,8 +52,12 @@ uvx git+https://github.com/eleqtrizit/llm-bench --model <model> --host <host> --
 Before measuring, the tool sends two short zero-context warmup requests so the
 server has the model fully loaded.
 
-Measured runs stream their response. The tool autodetects the best phase-rate
-source per run: llama.cpp-style `timings` counters from the final chunk when
+Measured runs stream their response. When the server is SGLang with
+`--enable-metrics`, the tool snapshots `/metrics` before and after each
+single-request run and reports prefill and decode tok/s from the server's own
+counters (TTFT, end-to-end latency, prompt and generation token counters).
+Otherwise it autodetects the best client-side phase-rate source per run:
+llama.cpp-style `timings` counters from the final chunk when
 present, otherwise time-to-first-token (which includes reasoning tokens on
 thinking models). Generation tok/s always counts first token to last. Rows
 marked with an asterisk used chunk-counted tokens because the server sent no

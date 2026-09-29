@@ -9,23 +9,36 @@ from unittest.mock import patch
 import pytest
 
 from llm_bench.spec_bench import (
+    METRIC_E2E_COUNT,
+    METRIC_E2E_SUM,
+    METRIC_GEN_TOKENS,
+    METRIC_PROMPT_TOKENS,
+    METRIC_TTFT_COUNT,
+    METRIC_TTFT_SUM,
     WARMUP_GEN_TOKENS,
     WARMUP_PROMPT,
     TASKS,
     build_prompt,
     choose_model,
+    diff_metrics,
     format_header,
     format_row,
     menu_select_ctx,
     menu_select_tasks,
+    metrics_to_rates,
     parse_args,
     parse_ctx,
+    parse_metrics_text,
     parse_task,
     query_models,
     render_menu,
     run_completion,
+    run_completion_measured,
+    snapshot_server_metrics,
     warm_up,
 )
+
+from llm_bench.spec_bench import RunResult
 
 
 class TestBuildPrompt:
@@ -349,3 +362,219 @@ class TestMenuSelectTasks:
             fake_stdin.isatty.return_value = False
             with pytest.raises(ValueError, match="--ctx"):
                 menu_select_ctx([0, 8])
+
+
+def _client_result(**overrides: object) -> RunResult:
+    """Build a representative client-measured RunResult for tests."""
+    fields = {
+        "prefill_tok_s": 10.0,
+        "gen_tok_s": 20.0,
+        "prompt_tok": 100,
+        "gen_tok": 50,
+        "ttft_s": 0.4,
+        "source": "usage",
+    }
+    fields.update(overrides)
+    return RunResult(**fields)  # type: ignore[arg-type]
+
+
+class TestParseMetricsText:
+    """parse_metrics_text behavior."""
+
+    def test_aggregates_labeled_series_by_base_name(self) -> None:
+        text = (
+            'sglang:prompt_tokens_total{is_streaming="false"} 10.0\n'
+            'sglang:prompt_tokens_total{is_streaming="true"} 32.0\n'
+            'sglang:time_to_first_token_seconds_sum{is_streaming="true"} 0.5\n'
+        )
+        values = parse_metrics_text(text)
+        assert values["sglang:prompt_tokens_total"] == 42.0
+        assert values["sglang:time_to_first_token_seconds_sum"] == 0.5
+
+    def test_skips_help_type_and_bucket_lines(self) -> None:
+        text = (
+            "# HELP sglang:prompt_tokens_total Number of prefill tokens.\n"
+            "# TYPE sglang:prompt_tokens_total counter\n"
+            'sglang:latency_bucket{le="0.1"} 3.0\n'
+            'sglang:latency_count{is_streaming="true"} 2.0\n'
+        )
+        values = parse_metrics_text(text)
+        assert "sglang:prompt_tokens_total" not in values
+        assert "sglang:latency_bucket" not in values
+        assert values["sglang:latency_count"] == 2.0
+
+    def test_skips_unparseable_lines(self) -> None:
+        values = parse_metrics_text("sglang:weird_metric not_a_number\n")
+        assert values == {}
+
+
+class TestSnapshotServerMetrics:
+    """snapshot_server_metrics behavior."""
+
+    def test_returns_values_when_all_required_present(self) -> None:
+        text = "".join(
+            f"{name}{{m=\"GLM\"}} 1.0\n"
+            for name in (
+                METRIC_PROMPT_TOKENS,
+                METRIC_GEN_TOKENS,
+                METRIC_TTFT_SUM,
+                METRIC_TTFT_COUNT,
+                METRIC_E2E_SUM,
+                METRIC_E2E_COUNT,
+            )
+        )
+        resp = io.BytesIO(text.encode())
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
+            values = snapshot_server_metrics("http://host:1", 10)
+        assert values[METRIC_PROMPT_TOKENS] == 1.0
+
+    def test_retries_until_required_metrics_appear(self) -> None:
+        partial = io.BytesIO(b"sglang:prompt_tokens_total 1.0\n")
+        full = io.BytesIO(
+            b"".join(
+                f"{name} 1.0\n".encode()
+                for name in (
+                    METRIC_PROMPT_TOKENS,
+                    METRIC_GEN_TOKENS,
+                    METRIC_TTFT_SUM,
+                    METRIC_TTFT_COUNT,
+                    METRIC_E2E_SUM,
+                    METRIC_E2E_COUNT,
+                )
+            )
+        )
+        with (
+            patch(
+                "llm_bench.spec_bench.urllib.request.urlopen",
+                side_effect=[partial, full],
+            ),
+            patch("llm_bench.spec_bench.time.sleep") as mock_sleep,
+        ):
+            values = snapshot_server_metrics("http://host:1", 10)
+        assert values[METRIC_GEN_TOKENS] == 1.0
+        mock_sleep.assert_called()
+
+    def test_raises_after_exhausted_retries(self) -> None:
+        resp = io.BytesIO(b"sglang:prompt_tokens_total 1.0\n")
+        with (
+            patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp),
+            patch("llm_bench.spec_bench.time.sleep"),
+            pytest.raises(RuntimeError, match="cannot read /metrics"),
+        ):
+            snapshot_server_metrics("http://host:1", 10)
+
+
+class TestDiffMetrics:
+    """diff_metrics behavior."""
+
+    def test_computes_deltas_for_shared_keys(self) -> None:
+        before = {"a": 1.0, "b": 10.0}
+        after = {"a": 4.0, "b": 7.0, "c": 2.0}
+        assert diff_metrics(before, after) == {"a": 3.0, "b": -3.0}
+
+    def test_handles_empty_snapshots(self) -> None:
+        assert diff_metrics({}, {"a": 1.0}) == {}
+        assert diff_metrics({"a": 1.0}, {}) == {}
+
+
+class TestMetricsToRates:
+    """metrics_to_rates behavior."""
+
+    def _deltas(self, **overrides: float) -> dict:
+        deltas = {
+            METRIC_TTFT_SUM: 0.5,
+            METRIC_TTFT_COUNT: 1.0,
+            METRIC_E2E_SUM: 2.5,
+            METRIC_E2E_COUNT: 1.0,
+            METRIC_PROMPT_TOKENS: 1000.0,
+            METRIC_GEN_TOKENS: 200.0,
+        }
+        deltas.update(overrides)
+        return deltas
+
+    def test_computes_server_measured_rates(self) -> None:
+        r = metrics_to_rates(self._deltas(), _client_result())
+        assert r is not None
+        assert r.source == "sglang"
+        assert r.prefill_tok_s == 1000 / 0.5
+        assert r.gen_tok_s == 200 / (2.5 - 0.5)
+        assert r.gen_tok == 200
+        assert r.prompt_tok == 1000
+
+    def test_rejects_overlapping_requests(self) -> None:
+        deltas = self._deltas(**{METRIC_TTFT_COUNT: 2.0, METRIC_E2E_COUNT: 2.0})
+        assert metrics_to_rates(deltas, _client_result()) is None
+
+    def test_rejects_missing_or_bad_deltas(self) -> None:
+        assert metrics_to_rates({}, _client_result()) is None
+        assert (
+            metrics_to_rates(self._deltas(**{METRIC_TTFT_SUM: 0.0}), _client_result())
+            is None
+        )
+        assert metrics_to_rates(self._deltas(**{METRIC_E2E_SUM: 0.1}), _client_result()) is None
+
+    def test_falls_back_to_client_token_counts_when_delta_missing(self) -> None:
+        deltas = self._deltas(**{METRIC_PROMPT_TOKENS: 0.0, METRIC_GEN_TOKENS: 0.0})
+        r = metrics_to_rates(deltas, _client_result(prompt_tok=77, gen_tok=33))
+        assert r is not None
+        assert r.prompt_tok == 77
+        assert r.gen_tok == 33
+
+
+class TestRunCompletionMeasured:
+    """run_completion_measured behavior."""
+
+    def test_uses_server_metrics_on_clean_deltas(self) -> None:
+        before = {
+            METRIC_TTFT_SUM: 1.0,
+            METRIC_TTFT_COUNT: 5.0,
+            METRIC_E2E_SUM: 10.0,
+            METRIC_E2E_COUNT: 5.0,
+            METRIC_PROMPT_TOKENS: 100.0,
+            METRIC_GEN_TOKENS: 100.0,
+        }
+        after = {k: v + delta for k, v, delta in zip(
+            list(before), before.values(),
+            [0.5, 1.0, 2.5, 1.0, 1000.0, 200.0],
+        )}
+        client = _client_result()
+        with (
+            patch(
+                "llm_bench.spec_bench.snapshot_server_metrics",
+                side_effect=[before, after],
+            ),
+            patch("llm_bench.spec_bench.run_completion", return_value=client),
+        ):
+            r = run_completion_measured("http://host:1", "m", "hi", 8, 10)
+        assert r.source == "sglang"
+        assert r.prefill_tok_s == 1000 / 0.5
+        assert r.gen_tok_s == 200 / 2.0
+
+    def test_falls_back_when_metrics_endpoint_missing(self, capsys) -> None:
+        client = _client_result()
+        with (
+            patch(
+                "llm_bench.spec_bench.snapshot_server_metrics",
+                side_effect=RuntimeError("no /metrics"),
+            ),
+            patch("llm_bench.spec_bench.run_completion", return_value=client),
+        ):
+            r = run_completion_measured("http://host:1", "m", "hi", 8, 10)
+        assert r is client
+        assert "client timing" in capsys.readouterr().out
+
+    def test_falls_back_after_poll_deadline(self) -> None:
+        client = _client_result()
+        empty: dict = {}
+        with (
+            patch(
+                "llm_bench.spec_bench.snapshot_server_metrics",
+                side_effect=[{}, empty],
+            ),
+            patch("llm_bench.spec_bench.run_completion", return_value=client),
+            patch("llm_bench.spec_bench.METRICS_POLL_DEADLINE_S", 0.0),
+            patch("llm_bench.spec_bench.time.sleep"),
+        ):
+            r = run_completion_measured("http://host:1", "m", "hi", 8, 10)
+        assert r is client
+        assert r.source == "usage"
