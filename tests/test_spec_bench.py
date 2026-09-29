@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import re
+import urllib.error
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +22,7 @@ from llm_bench.spec_bench import (
     build_prompt,
     choose_model,
     diff_metrics,
+    detect_engine,
     format_header,
     format_row,
     menu_select_ctx,
@@ -35,6 +37,7 @@ from llm_bench.spec_bench import (
     run_completion,
     run_completion_measured,
     snapshot_server_metrics,
+    TENSORFOLD_ENGINE,
     warm_up,
 )
 
@@ -199,6 +202,14 @@ class TestTableFormatting:
         row_end = row.index("191.65") + len("191.65")
         assert header_end == row_end
 
+    def test_row_appends_draft_acceptance_when_positive(self) -> None:
+        row = format_row(0, "code", 20, 93, 900.0, 191.65, "tensorfold", 0.654)
+        assert row.endswith("draft=65%")
+
+    def test_row_has_no_draft_note_when_zero(self) -> None:
+        row = format_row(0, "code", 20, 93, 900.0, 191.65)
+        assert "draft" not in row
+
 
 class TestRunCompletion:
     """run_completion streaming behavior."""
@@ -279,6 +290,129 @@ class TestRunCompletion:
         with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
             with pytest.raises(RuntimeError, match="no tokens"):
                 run_completion("http://host:1", "m", "hi", 8, 10)
+
+    def test_uses_tensorfold_telemetry_block(self) -> None:
+        chunks = [
+            {"choices": [{"delta": {"reasoning_content": "think"}}]},
+            {"choices": [{"delta": {"content": "ans"}}]},
+            {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 80},
+                "tensorfold": {
+                    "prefill_s": 0.05,
+                    "decode_s": 0.4,
+                    "drafts": True,
+                    "drafted": 100,
+                    "accepted": 60,
+                    "decode_tps": 200.0,
+                },
+            },
+        ]
+        resp = self._sse_body(chunks)
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
+            r = run_completion("http://host:1", "m", "hi", 8, 10)
+        assert r.source == TENSORFOLD_ENGINE
+        assert r.prefill_tok_s == pytest.approx(100 / 0.05)
+        assert r.gen_tok_s == pytest.approx(80 / 0.4)
+        assert r.prompt_tok == 100
+        assert r.gen_tok == 80
+        assert r.draft_acceptance == pytest.approx(0.6)
+
+    def test_tensorfold_reasoning_content_starts_ttft(self) -> None:
+        chunks = [
+            {"choices": [{"delta": {"reasoning_content": "think"}}]},
+            {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            },
+        ]
+        resp = self._sse_body(chunks)
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
+            r = run_completion("http://host:1", "m", "hi", 8, 10)
+        assert r.ttft_s > 0
+        assert r.gen_tok == 2
+        assert r.draft_acceptance == 0.0
+
+    def test_tensorfold_block_missing_prefill_is_ignored(self) -> None:
+        chunks = [
+            {"choices": [{"delta": {"content": "a"}}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+                "tensorfold": {"prefill_s": 0.0, "decode_s": 0.0},
+            },
+        ]
+        resp = self._sse_body(chunks)
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
+            r = run_completion("http://host:1", "m", "hi", 8, 10)
+        assert r.source == "usage"
+        assert r.draft_acceptance == 0.0
+
+
+class TestDetectEngine:
+    """detect_engine behavior."""
+
+    def _body(self, body: dict) -> io.BytesIO:
+        return io.BytesIO(json.dumps(body).encode())
+
+    def test_detects_tensorfold_owned_by(self) -> None:
+        body = {"data": [{"id": "m", "owned_by": "tensorfold"}]}
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=self._body(body)):
+            assert detect_engine("http://host:1", 10) == "tensorfold"
+
+    def test_unknown_engine_returns_empty(self) -> None:
+        body = {"data": [{"id": "m", "owned_by": "sglang"}]}
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=self._body(body)):
+            assert detect_engine("http://host:1", 10) == ""
+
+    def test_unreachable_server_returns_empty(self) -> None:
+        def raise_url_error(*_: object) -> None:
+            raise RuntimeError("boom")
+
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", side_effect=raise_url_error):
+            assert detect_engine("http://host:1", 10) == ""
+
+    def test_http_404_metrics_is_unavailable_not_fatal(self) -> None:
+        with patch(
+            "llm_bench.spec_bench.urllib.request.urlopen",
+            side_effect=urllib.error.HTTPError(
+                "http://host:1/metrics", 404, "not found", None, None  # type: ignore[arg-type]
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="HTTP 404"):
+                snapshot_server_metrics("http://host:1", 10)
+
+
+class TestRunCompletionMeasuredTensorfold:
+    """TensorFold shortcut path in run_completion_measured."""
+
+    def test_skips_metrics_snapshot_when_engine_detected(self) -> None:
+        client = _client_result(source="tensorfold", draft_acceptance=0.65)
+        with (
+            patch("llm_bench.spec_bench.snapshot_server_metrics") as mock_snap,
+            patch("llm_bench.spec_bench.run_completion", return_value=client) as mock_run,
+        ):
+            r = run_completion_measured(
+                "http://host:1", "m", "hi", 8, 10, engine=TENSORFOLD_ENGINE
+            )
+        assert r is client
+        mock_snap.assert_not_called()
+        mock_run.assert_called_once()
+
+    def test_engine_argument_is_passed_when_engine_unknown(self) -> None:
+        before = {METRIC_TTFT_SUM: 1.0, METRIC_TTFT_COUNT: 1.0,
+                  METRIC_E2E_SUM: 3.0, METRIC_E2E_COUNT: 1.0,
+                  METRIC_PROMPT_TOKENS: 100.0, METRIC_GEN_TOKENS: 100.0}
+        after = {k: v + d for k, v, d in zip(
+            list(before), before.values(),
+            [0.5, 1.0, 2.5, 1.0, 1000.0, 200.0])}
+        client = _client_result()
+        with (
+            patch("llm_bench.spec_bench.snapshot_server_metrics", side_effect=[before, after]),
+            patch("llm_bench.spec_bench.run_completion", return_value=client),
+        ):
+            r = run_completion_measured("http://host:1", "m", "hi", 8, 10)
+        assert r.source == "sglang"
 
 
 class TestWarmUp:
@@ -373,6 +507,7 @@ def _client_result(**overrides: object) -> RunResult:
         "gen_tok": 50,
         "ttft_s": 0.4,
         "source": "usage",
+        "draft_acceptance": 0.0,
     }
     fields.update(overrides)
     return RunResult(**fields)  # type: ignore[arg-type]

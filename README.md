@@ -56,6 +56,10 @@ Measured runs stream their response. When the server is SGLang with
 `--enable-metrics`, the tool snapshots `/metrics` before and after each
 single-request run and reports prefill and decode tok/s from the server's own
 counters (TTFT, end-to-end latency, prompt and generation token counters).
+When the server is TensorFold (detected by `owned_by: "tensorfold"` on
+`/v1/models`), the rates come from the engine's own telemetry block attached
+to each response (`prefill_s`, `decode_s`), and each row also shows the
+speculative draft acceptance rate (`draft=NN%`).
 Otherwise it autodetects the best client-side phase-rate source per run:
 llama.cpp-style `timings` counters from the final chunk when
 present, otherwise time-to-first-token (which includes reasoning tokens on

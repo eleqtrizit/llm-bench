@@ -41,6 +41,11 @@ REQUIRED_METRICS = (
 METRICS_POLL_INTERVAL_S = 0.5
 METRICS_POLL_DEADLINE_S = 10.0
 METRICS_SNAPSHOT_RETRIES = 5
+
+# TensorFold serves no /metrics endpoint; it attaches an engine telemetry
+# block to every completion response instead. The block is named after the
+# engine ("tensorfold") and carries its own prefill/decode accounting.
+TENSORFOLD_ENGINE = "tensorfold"
 TASKS: Dict[str, str] = {
     "code": "Write a Python Snake game.",
     "prose": "Write me a poem about Agents and LLMs.",
@@ -106,7 +111,11 @@ class RunResult:
         source: Which mechanism produced the phase rates: ``timings`` for
             llama.cpp-style server counters, ``usage`` for the TTFT-based
             fallback, ``estimated`` when token counts were chunk-counted,
-            ``sglang`` when the rates came from SGLang /metrics deltas.
+            ``sglang`` when the rates came from SGLang /metrics deltas, and
+            ``tensorfold`` when the rates came from the TensorFold telemetry
+            block attached to the completion response.
+        draft_acceptance: Fraction of drafted speculative tokens the engine
+            accepted, from the TensorFold telemetry block; 0.0 when absent.
     """
 
     prefill_tok_s: float
@@ -115,6 +124,7 @@ class RunResult:
     gen_tok: int
     ttft_s: float
     source: str
+    draft_acceptance: float = 0.0
 
 
 def run_completion(
@@ -165,6 +175,7 @@ def run_completion(
     n_chunk_tokens = 0
     usage: Dict[str, int] | None = None
     timings: Dict[str, float] | None = None
+    engine_stats: Dict[str, float] | None = None
     ttft = 0.0
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -184,11 +195,19 @@ def run_completion(
                 usage = chunk["usage"]
             if chunk.get("timings"):
                 timings = chunk["timings"]
+            if isinstance(chunk.get("tensorfold"), dict):
+                engine_stats = chunk["tensorfold"]
             for choice in chunk.get("choices", []):
                 delta = choice.get("delta") or {}
                 # Reasoning deltas stream before content on thinking models;
                 # both signal that prefill finished and generation began.
-                if delta.get("content") or delta.get("reasoning"):
+                # TensorFold names the field reasoning_content, llama.cpp
+                # squeezing-style servers use reasoning.
+                if (
+                    delta.get("content")
+                    or delta.get("reasoning")
+                    or delta.get("reasoning_content")
+                ):
                     n_chunk_tokens += 1
                     if ttft == 0.0:
                         ttft = time.perf_counter() - t0
@@ -197,7 +216,24 @@ def run_completion(
     n_prompt_server = (usage or {}).get("prompt_tokens", 0)
     n_gen_server = (usage or {}).get("completion_tokens", 0)
 
-    if timings and timings.get("prompt_n") and timings.get("prompt_ms"):
+    n_gen = n_gen_server or n_chunk_tokens
+    n_prompt = n_prompt_server
+    source = "usage"
+    draft_acceptance = 0.0
+    prefill_tok_s = 0.0
+    gen_tok_s = 0.0
+    if engine_stats and engine_stats.get("prefill_s") and engine_stats.get("decode_s"):
+        # TensorFold reports its own prefill and decode wall time per request,
+        # so both rates come from the server's accounting, not client timing.
+        prefill_s = float(engine_stats["prefill_s"])
+        decode_s = float(engine_stats["decode_s"])
+        drafted = float(engine_stats.get("drafted") or 0)
+        accepted = float(engine_stats.get("accepted") or 0)
+        prefill_tok_s = n_prompt / prefill_s if (n_prompt and prefill_s > 0) else 0.0
+        gen_tok_s = n_gen / decode_s if decode_s > 0 else 0.0
+        source = "tensorfold"
+        draft_acceptance = accepted / drafted if drafted > 0 else 0.0
+    elif timings and timings.get("prompt_n") and timings.get("prompt_ms"):
         prompt_ms = float(timings["prompt_ms"])
         prefill_tok_s = timings["prompt_n"] / (prompt_ms / 1000.0)
         n_prompt = int(timings["prompt_n"])
@@ -205,12 +241,9 @@ def run_completion(
             n_gen = int(timings["predicted_n"])
             gen_tok_s = n_gen / (float(timings["predicted_ms"]) / 1000.0)
         else:
-            n_gen = n_gen_server or n_chunk_tokens
             gen_tok_s = n_gen / max(total - ttft, 1e-9)
         source = "timings"
     else:
-        n_gen = n_gen_server or n_chunk_tokens
-        n_prompt = n_prompt_server
         gen_seconds = max(total - ttft, 1e-9)
         gen_tok_s = n_gen / gen_seconds
         prefill_tok_s = n_prompt / ttft if (n_prompt and ttft > 0) else 0.0
@@ -225,6 +258,7 @@ def run_completion(
         gen_tok=n_gen,
         ttft_s=ttft,
         source=source,
+        draft_acceptance=draft_acceptance,
     )
 
 
@@ -288,6 +322,10 @@ def snapshot_server_metrics(
             if not missing:
                 return values
             last_error = RuntimeError(f"/metrics is missing {', '.join(missing)}")
+        except urllib.error.HTTPError as e:
+            # Engines without a /metrics endpoint (for example TensorFold)
+            # answer 404, which means "metrics unavailable", not unreachable.
+            last_error = RuntimeError(f"/metrics returned HTTP {e.code}")
         except urllib.error.URLError:
             raise
         except Exception as e:  # noqa: BLE001 - retry transient scrape failures
@@ -351,7 +389,12 @@ def metrics_to_rates(
 
 
 def run_completion_measured(
-    base_url: str, model: str, prompt: str, gen_tokens: int, timeout: int
+    base_url: str,
+    model: str,
+    prompt: str,
+    gen_tokens: int,
+    timeout: int,
+    engine: str = "",
 ) -> RunResult:
     """Run one completion and report throughput from SGLang server metrics.
 
@@ -367,6 +410,9 @@ def run_completion_measured(
         prompt: The user prompt text.
         gen_tokens: Maximum tokens to generate.
         timeout: Request timeout in seconds.
+        engine: Engine name from :func:`detect_engine`; when it is
+            ``tensorfold``, the SGLang /metrics snapshot is skipped because
+            TensorFold attaches its telemetry to each response instead.
 
     Returns:
         A :class:`RunResult`; ``source`` is ``sglang`` when server metrics
@@ -376,6 +422,9 @@ def run_completion_measured(
         RuntimeError: If the server generates no tokens.
         urllib.error.URLError: If the server is unreachable or times out.
     """
+    if engine == TENSORFOLD_ENGINE:
+        return run_completion(base_url, model, prompt, gen_tokens, timeout)
+
     metrics_unavailable: Exception | None = None
     before: Dict[str, float] | None = None
     try:
@@ -386,6 +435,8 @@ def run_completion_measured(
         metrics_unavailable = e
 
     result = run_completion(base_url, model, prompt, gen_tokens, timeout)
+    if result.source == TENSORFOLD_ENGINE:
+        return result
     if before is None:
         if metrics_unavailable is not None:
             print(f"  (server metrics unavailable, using client timing: {metrics_unavailable})")
@@ -424,6 +475,33 @@ def query_models(base_url: str, timeout: int) -> List[str]:
     if not models:
         raise RuntimeError(f"no models in /v1/models response: {body}")
     return models
+
+
+def detect_engine(base_url: str, timeout: int) -> str:
+    """Identify the serving engine behind an OpenAI-compatible endpoint.
+
+    SGLang exposes ``sglang:`` Prometheus series on ``/metrics``; TensorFold
+    signs every model entry in ``/v1/models`` with ``owned_by: "tensorfold"``.
+    Detection is best effort: any failure to reach or parse the endpoint
+    yields an empty string and the bench falls back to client timing.
+
+    Args:
+        base_url: Server root, for example ``http://127.0.0.1:8080``.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        The engine name, currently ``"tensorfold"`` when detected, else ``""``.
+    """
+    try:
+        req = urllib.request.Request(base_url + "/v1/models", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read())
+        for entry in body.get("data", []):
+            if entry.get("owned_by") == TENSORFOLD_ENGINE:
+                return TENSORFOLD_ENGINE
+    except Exception:  # noqa: BLE001 - detection is best effort
+        pass
+    return ""
 
 
 def choose_model(models: List[str]) -> int:
@@ -769,6 +847,7 @@ def format_row(
     prefill_tok_s: float,
     tok_s: float,
     source: str = "usage",
+    draft_acceptance: float = 0.0,
 ) -> str:
     """Build one aligned results-table row.
 
@@ -781,6 +860,8 @@ def format_row(
         tok_s: Generation throughput of this run in tokens per second.
         source: Provenance of the rates; ``estimated`` rows get an asterisk
             on the throughput columns.
+        draft_acceptance: TensorFold speculative-draft acceptance rate; when
+            above 0 a ``draft=NN%`` note is appended to the row.
 
     Returns:
         The formatted row, aligned with the header columns. Unknown prefill
@@ -793,10 +874,13 @@ def format_row(
         tok_str = f"{tok_s:.2f}*"
     else:
         tok_str = f"{tok_s:.2f}"
-    return (
+    row = (
         f"{ctx_str:>8} {task:<6} {prompt_tok:>13} {gen_tok:>10} "
         f"{prefill_str:>16} {tok_str:>12}"
     )
+    if draft_acceptance > 0:
+        row += f"  draft={draft_acceptance:.0%}"
+    return row
 
 
 def bench_lengths(
@@ -806,6 +890,7 @@ def bench_lengths(
     tasks: List[str],
     gen_tokens: int,
     timeout: int,
+    engine: str = "",
 ) -> None:
     """Benchmark every selected task at each context size and print the rows.
 
@@ -816,6 +901,8 @@ def bench_lengths(
         tasks: Generation task names, in :data:`TASKS`.
         gen_tokens: Maximum tokens to generate per run.
         timeout: Request timeout in seconds.
+        engine: Engine name from :func:`detect_engine`, for the measured path
+            to select the server-metrics mechanism.
 
     Returns:
         None. Each completed run is printed as one table row.
@@ -825,7 +912,7 @@ def bench_lengths(
             prompt = build_prompt(ctx, TASKS[task])
             try:
                 result = run_completion_measured(
-                    base_url, model, prompt, gen_tokens, timeout
+                    base_url, model, prompt, gen_tokens, timeout, engine
                 )
             except Exception as e:  # noqa: BLE001 - report and continue
                 print(f"{ctx:>8} {task:<6}   FAILED: {e}")
@@ -839,6 +926,7 @@ def bench_lengths(
                     result.prefill_tok_s,
                     result.gen_tok_s,
                     result.source,
+                    result.draft_acceptance,
                 )
             )
 
@@ -898,10 +986,13 @@ def main(argv: List[str] | None = None) -> None:
     except Exception as e:
         raise SystemExit(f"error: cannot reach server at {base_url}: {e}") from e
 
-    print(f"llm-bench: {base_url}  model={model}")
+    engine = detect_engine(base_url, args.timeout)
+    engine_note = f" engine={engine}" if engine else " engine=unknown"
+    print(f"llm-bench: {base_url}  model={model}{engine_note}")
     print(
         "throughput numbers come from the SGLang server's own /metrics"
-        " when available; client timing is the fallback"
+        " when available, or the TensorFold per-response telemetry block;"
+        " client timing is the fallback"
     )
     print(f"gen_tokens={args.gen_tokens}, one run per context size")
     hdr = format_header()
@@ -915,6 +1006,7 @@ def main(argv: List[str] | None = None) -> None:
         tasks,
         args.gen_tokens,
         args.timeout,
+        engine,
     )
 
 
