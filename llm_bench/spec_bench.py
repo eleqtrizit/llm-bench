@@ -2,7 +2,7 @@
 """llm-bench: benchmark tok/s on any OpenAI-compatible server.
 
 Benchmarks generation throughput (tok/s) at prompt/context lengths of
-0, 8, 16, 32, 64 and 128 tokens (or override with ``--lengths``).
+2, 8, 16, 32, 64 and 128 tokens (or override with ``--lengths``).
 """
 
 from __future__ import annotations
@@ -19,7 +19,11 @@ import urllib.error
 import urllib.request
 from typing import Dict, List
 
-DEFAULT_CTX_OPTIONS = [0, 8, 32, 64, 128, 200]
+DEFAULT_CTX_OPTIONS = [2, 8, 32, 64, 128, 200]
+
+# The smallest measurable context size, in kilotokens. Runs below this floor
+# only exercise the decode path with no real prefill work.
+MIN_CTX_K = 2
 
 # Prometheus metrics used for server-reported throughput numbers. The
 # bench snapshots /metrics before and after each single-request run and reads
@@ -819,20 +823,23 @@ def parse_ctx(raw: str) -> List[int]:
 
     Args:
         raw: Comma-separated context sizes in kilotokens, for example
-            ``0,8,16``.
+            ``2,8,16``.
 
     Returns:
         The parsed context sizes, in kilotokens.
 
     Raises:
-        argparse.ArgumentTypeError: If any value is not a non-negative integer.
+        argparse.ArgumentTypeError: If any value is not an integer of at
+            least ``MIN_CTX_K`` kilotokens.
     """
     try:
         values = [int(v.strip()) for v in raw.split(",")]
     except ValueError:
         raise argparse.ArgumentTypeError(f"invalid --ctx value: {raw!r}") from None
-    if any(v < 0 for v in values):
-        raise argparse.ArgumentTypeError(f"--ctx values must be >= 0: {raw!r}")
+    if any(v < MIN_CTX_K for v in values):
+        raise argparse.ArgumentTypeError(
+            f"--ctx values must be >= {MIN_CTX_K} (kilotokens): {raw!r}"
+        )
     return values
 
 
@@ -865,7 +872,8 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         "--ctx",
         type=parse_ctx,
         help=(
-            "comma-separated context sizes in kilotokens, for example 0,8,16"
+            "comma-separated context sizes in kilotokens, minimum 2, for"
+            " example 2,8,16"
             " (omit to pick from an interactive menu)"
         ),
     )

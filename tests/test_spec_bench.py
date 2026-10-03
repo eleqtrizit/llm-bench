@@ -95,12 +95,12 @@ class TestParseArgs:
             parse_args(["--port", "8080"])
 
     def test_custom_ctx(self) -> None:
-        args = parse_args(["--model", "m", "--host", "h", "--port", "1", "--ctx", "0,8,16"])
-        assert args.ctx == [0, 8, 16]
+        args = parse_args(["--model", "m", "--host", "h", "--port", "1", "--ctx", "2,8,16"])
+        assert args.ctx == [2, 8, 16]
 
     def test_invalid_ctx_exits(self) -> None:
         with pytest.raises(SystemExit):
-            parse_args(["--model", "m", "--host", "h", "--port", "1", "--ctx", "0,eight"])
+            parse_args(["--model", "m", "--host", "h", "--port", "1", "--ctx", "2,eight"])
 
     def test_negative_ctx_exits(self) -> None:
         with pytest.raises(SystemExit):
@@ -114,25 +114,25 @@ class TestMenuSelectCtx:
         with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
             fake_stdin.isatty.return_value = False
             with pytest.raises(ValueError, match="no terminal"):
-                menu_select_ctx([0, 8])
+                menu_select_ctx([2, 8])
 
 
 class TestParseCtx:
     """parse_ctx behavior."""
 
     def test_parses_comma_separated_values(self) -> None:
-        assert parse_ctx("0,8,16") == [0, 8, 16]
+        assert parse_ctx("2,8,16") == [2, 8, 16]
 
     def test_whitespace_is_ignored(self) -> None:
-        assert parse_ctx("0, 8 ,16") == [0, 8, 16]
+        assert parse_ctx("2, 8 ,16") == [2, 8, 16]
 
     def test_rejects_non_numeric_values(self) -> None:
         with pytest.raises(argparse.ArgumentTypeError):
-            parse_ctx("0,eight")
+            parse_ctx("2,eight")
 
     def test_rejects_negative_values(self) -> None:
         with pytest.raises(argparse.ArgumentTypeError):
-            parse_ctx("0,-4")
+            parse_ctx("2,-4")
 
 
 class TestQueryModels:
@@ -568,7 +568,7 @@ class TestMenuSelectTasks:
         with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
             fake_stdin.isatty.return_value = False
             with pytest.raises(ValueError, match="--ctx"):
-                menu_select_ctx([0, 8])
+                menu_select_ctx([2, 8])
 
 
 def _client_result(**overrides: object) -> RunResult:
