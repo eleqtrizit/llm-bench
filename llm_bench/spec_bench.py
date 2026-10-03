@@ -21,9 +21,34 @@ from typing import Dict, List
 
 DEFAULT_CTX_OPTIONS = [0, 8, 32, 64, 128, 200]
 
-# SGLang Prometheus metrics used for server-reported throughput numbers. The
+# Prometheus metrics used for server-reported throughput numbers. The
 # bench snapshots /metrics before and after each single-request run and reads
-# the deltas, so every number comes from the server's own accounting.
+# the deltas, so every number comes from the server's own accounting. SGLang
+# and vLLM expose the same histogram shapes under different prefixes, so
+# metric names are built per detected engine.
+METRIC_BASES = (
+    "prompt_tokens_total",
+    "generation_tokens_total",
+    "time_to_first_token_seconds_sum",
+    "time_to_first_token_seconds_count",
+    "e2e_request_latency_seconds_sum",
+    "e2e_request_latency_seconds_count",
+)
+METRIC_ROLES = (
+    "prompt_tokens",
+    "gen_tokens",
+    "ttft_sum",
+    "ttft_count",
+    "e2e_sum",
+    "e2e_count",
+)
+METRIC_BASE_BY_ROLE = dict(zip(METRIC_ROLES, METRIC_BASES))
+
+# Engines that expose /metrics and the Prometheus family prefix each uses.
+ENGINE_METRIC_PREFIXES = {"sglang": "sglang:", "vllm": "vllm:"}
+DEFAULT_ENGINE = "sglang"
+
+# SGLang metric names, kept for the default path and existing callers.
 METRIC_PROMPT_TOKENS = "sglang:prompt_tokens_total"
 METRIC_GEN_TOKENS = "sglang:generation_tokens_total"
 METRIC_TTFT_SUM = "sglang:time_to_first_token_seconds_sum"
@@ -46,6 +71,36 @@ METRICS_SNAPSHOT_RETRIES = 5
 # block to every completion response instead. The block is named after the
 # engine ("tensorfold") and carries its own prefill/decode accounting.
 TENSORFOLD_ENGINE = "tensorfold"
+
+
+def metric_prefix(engine: str = DEFAULT_ENGINE) -> str:
+    """Return the Prometheus family prefix for a detected engine.
+
+    Args:
+        engine: Engine name from :func:`detect_engine`; an empty string
+            means the engine is unknown and the SGLang prefix is used.
+
+    Returns:
+        The metric-name prefix, for example ``"vllm:"``; engines with an
+        unknown prefix fall back to SGLang.
+    """
+    return ENGINE_METRIC_PREFIXES.get(engine or DEFAULT_ENGINE, "sglang:")
+
+
+def metric_full_names(engine: str = DEFAULT_ENGINE) -> Dict[str, str]:
+    """Map metric roles to fully qualified Prometheus names for an engine.
+
+    Args:
+        engine: Engine name from :func:`detect_engine`.
+
+    Returns:
+        A mapping from role (for example ``"ttft_sum"``) to the metric name
+        the engine serves, for example ``"vllm:time_to_first_token_seconds_sum"``.
+    """
+    prefix = metric_prefix(engine)
+    return {role: prefix + base for role, base in METRIC_BASE_BY_ROLE.items()}
+
+
 TASKS: Dict[str, str] = {
     "code": "Write a Python Snake game.",
     "prose": "Write me a poem about Agents and LLMs.",
@@ -262,7 +317,7 @@ def run_completion(
     )
 
 
-def parse_metrics_text(text: str) -> Dict[str, float]:
+def parse_metrics_text(text: str, prefix: str = "sglang:") -> Dict[str, float]:
     """Parse a Prometheus exposition document into a metric-name sum map.
 
     Labeled series such as ``metric{a="b"} 1.0`` are aggregated by base metric
@@ -272,14 +327,16 @@ def parse_metrics_text(text: str) -> Dict[str, float]:
 
     Args:
         text: The raw ``/metrics`` response body.
+        prefix: Metric-family prefix to keep, for example ``"vllm:"``;
+            only series under this prefix are parsed.
 
     Returns:
         A mapping from base metric name (for example
-        ``sglang:time_to_first_token_seconds_sum``) to the summed value.
+        ``vllm:time_to_first_token_seconds_sum``) to the summed value.
     """
     values: Dict[str, float] = {}
     for line in text.splitlines():
-        if not line.startswith("sglang:") or line.startswith("#"):
+        if not line.startswith(prefix) or line.startswith("#"):
             continue
         name, _, raw_value = line.rpartition(" ")
         key = name.split("{")[0]
@@ -293,7 +350,10 @@ def parse_metrics_text(text: str) -> Dict[str, float]:
 
 
 def snapshot_server_metrics(
-    base_url: str, timeout: int, required: tuple[str, ...] = REQUIRED_METRICS
+    base_url: str,
+    timeout: int,
+    required: tuple[str, ...] = REQUIRED_METRICS,
+    prefix: str = "sglang:",
 ) -> Dict[str, float]:
     """Fetch and parse ``/metrics``, retrying until every required name appears.
 
@@ -305,6 +365,8 @@ def snapshot_server_metrics(
         base_url: Server root, for example ``http://127.0.0.1:8080``.
         timeout: Per-request timeout in seconds.
         required: Metric names that must be present in the snapshot.
+        prefix: Prometheus family prefix to parse, matched to the engine
+            detected for the server.
 
     Returns:
         The parsed metric map.
@@ -317,7 +379,7 @@ def snapshot_server_metrics(
     for _ in range(METRICS_SNAPSHOT_RETRIES):
         try:
             with urllib.request.urlopen(base_url + "/metrics", timeout=timeout) as resp:
-                values = parse_metrics_text(resp.read().decode())
+                values = parse_metrics_text(resp.read().decode(), prefix)
             missing = [name for name in required if name not in values]
             if not missing:
                 return values
@@ -351,7 +413,9 @@ def diff_metrics(
 
 
 def metrics_to_rates(
-    deltas: Dict[str, float], client_result: "RunResult"
+    deltas: Dict[str, float],
+    client_result: "RunResult",
+    names: Dict[str, str] | None = None,
 ) -> "RunResult | None":
     """Turn single-request metric deltas into server-measured rates.
 
@@ -364,17 +428,21 @@ def metrics_to_rates(
         deltas: Metric deltas from :func:`diff_metrics`.
         client_result: The client-measured result, reused for token counts
             whenever a server delta is unavailable.
+        names: Mapping from metric role to the full Prometheus name, from
+            :func:`metric_full_names`; defaults to the SGLang names.
 
     Returns:
         A :class:`RunResult` with ``source == "sglang"``, or None when the
         deltas do not describe exactly one clean request.
     """
-    ttft_count = deltas.get(METRIC_TTFT_COUNT, 0.0)
-    e2e_count = deltas.get(METRIC_E2E_COUNT, 0.0)
-    ttft = deltas.get(METRIC_TTFT_SUM, 0.0)
-    e2e = deltas.get(METRIC_E2E_SUM, 0.0)
-    prompt_tok = deltas.get(METRIC_PROMPT_TOKENS, 0.0)
-    gen_tok = deltas.get(METRIC_GEN_TOKENS, 0.0)
+    if names is None:
+        names = metric_full_names(DEFAULT_ENGINE)
+    ttft_count = deltas.get(names["ttft_count"], 0.0)
+    e2e_count = deltas.get(names["e2e_count"], 0.0)
+    ttft = deltas.get(names["ttft_sum"], 0.0)
+    e2e = deltas.get(names["e2e_sum"], 0.0)
+    prompt_tok = deltas.get(names["prompt_tokens"], 0.0)
+    gen_tok = deltas.get(names["gen_tokens"], 0.0)
     if ttft_count != 1 or e2e_count != 1 or ttft <= 0 or e2e <= ttft:
         return None
     decode_seconds = e2e - ttft
@@ -410,9 +478,10 @@ def run_completion_measured(
         prompt: The user prompt text.
         gen_tokens: Maximum tokens to generate.
         timeout: Request timeout in seconds.
-        engine: Engine name from :func:`detect_engine`; when it is
-            ``tensorfold``, the SGLang /metrics snapshot is skipped because
-            TensorFold attaches its telemetry to each response instead.
+        engine: Engine name from :func:`detect_engine`; ``tensorfold`` skips
+            the /metrics snapshot because TensorFold attaches its telemetry
+            to each response instead, while ``sglang`` and ``vllm`` select
+            the matching Prometheus family prefix for the deltas.
 
     Returns:
         A :class:`RunResult`; ``source`` is ``sglang`` when server metrics
@@ -425,10 +494,14 @@ def run_completion_measured(
     if engine == TENSORFOLD_ENGINE:
         return run_completion(base_url, model, prompt, gen_tokens, timeout)
 
+    prefix = metric_prefix(engine)
+    names = metric_full_names(engine)
     metrics_unavailable: Exception | None = None
     before: Dict[str, float] | None = None
     try:
-        before = snapshot_server_metrics(base_url, timeout)
+        before = snapshot_server_metrics(
+            base_url, timeout, required=tuple(names.values()), prefix=prefix
+        )
     except (RuntimeError, urllib.error.URLError) as e:
         if isinstance(e, urllib.error.URLError):
             raise
@@ -444,8 +517,10 @@ def run_completion_measured(
 
     deadline = time.monotonic() + METRICS_POLL_DEADLINE_S
     while True:
-        after = snapshot_server_metrics(base_url, timeout)
-        rates = metrics_to_rates(diff_metrics(before, after), result)
+        after = snapshot_server_metrics(
+            base_url, timeout, required=tuple(names.values()), prefix=prefix
+        )
+        rates = metrics_to_rates(diff_metrics(before, after), result, names)
         if rates is not None:
             return rates
         if time.monotonic() >= deadline:
@@ -480,25 +555,38 @@ def query_models(base_url: str, timeout: int) -> List[str]:
 def detect_engine(base_url: str, timeout: int) -> str:
     """Identify the serving engine behind an OpenAI-compatible endpoint.
 
-    SGLang exposes ``sglang:`` Prometheus series on ``/metrics``; TensorFold
-    signs every model entry in ``/v1/models`` with ``owned_by: "tensorfold"``.
-    Detection is best effort: any failure to reach or parse the endpoint
-    yields an empty string and the bench falls back to client timing.
+    TensorFold signs every model entry in ``/v1/models`` with
+    ``owned_by: "tensorfold"``; SGLang and vLLM sign theirs with the engine
+    name. When the model list does not identify the engine, ``/metrics`` is
+    sniffed for the ``sglang:`` or ``vllm:`` family prefixes. Detection is
+    best effort: any failure to reach or parse the endpoints yields an empty
+    string and the bench falls back to client timing.
 
     Args:
         base_url: Server root, for example ``http://127.0.0.1:8080``.
         timeout: Request timeout in seconds.
 
     Returns:
-        The engine name, currently ``"tensorfold"`` when detected, else ``""``.
+        The engine name: ``"tensorfold"``, ``"sglang"``, ``"vllm"``, or
+        ``""`` when detection failed.
     """
     try:
         req = urllib.request.Request(base_url + "/v1/models", method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read())
         for entry in body.get("data", []):
-            if entry.get("owned_by") == TENSORFOLD_ENGINE:
-                return TENSORFOLD_ENGINE
+            owned_by = entry.get("owned_by")
+            if owned_by == TENSORFOLD_ENGINE or owned_by in ENGINE_METRIC_PREFIXES:
+                return owned_by
+    except Exception:  # noqa: BLE001 - detection is best effort
+        pass
+
+    try:
+        with urllib.request.urlopen(base_url + "/metrics", timeout=timeout) as resp:
+            text = resp.read().decode()
+        for engine, prefix in ENGINE_METRIC_PREFIXES.items():
+            if text.startswith(prefix) or f"\n{prefix}" in text:
+                return engine
     except Exception:  # noqa: BLE001 - detection is best effort
         pass
     return ""
@@ -990,8 +1078,9 @@ def main(argv: List[str] | None = None) -> None:
     engine_note = f" engine={engine}" if engine else " engine=unknown"
     print(f"llm-bench: {base_url}  model={model}{engine_note}")
     print(
-        "throughput numbers come from the SGLang server's own /metrics"
-        " when available, or the TensorFold per-response telemetry block;"
+        "throughput numbers come from the server's own /metrics"
+        " (SGLang or vLLM) when available, or the"
+        " TensorFold per-response telemetry block;"
         " client timing is the fallback"
     )
     print(f"gen_tokens={args.gen_tokens}, one run per context size")

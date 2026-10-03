@@ -360,9 +360,32 @@ class TestDetectEngine:
         with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=self._body(body)):
             assert detect_engine("http://host:1", 10) == "tensorfold"
 
-    def test_unknown_engine_returns_empty(self) -> None:
+    def test_detects_sglang_owned_by(self) -> None:
         body = {"data": [{"id": "m", "owned_by": "sglang"}]}
         with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=self._body(body)):
+            assert detect_engine("http://host:1", 10) == "sglang"
+
+    def test_detects_vllm_owned_by(self) -> None:
+        body = {"data": [{"id": "m", "owned_by": "vllm"}]}
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=self._body(body)):
+            assert detect_engine("http://host:1", 10) == "vllm"
+
+    def test_sniffs_vllm_from_metrics_when_owned_by_unknown(self) -> None:
+        body = {"data": [{"id": "m", "owned_by": "organization"}]}
+        metrics = io.BytesIO(b"vllm:prompt_tokens_total{model_name=\"m\"} 1.0\n")
+        with patch(
+            "llm_bench.spec_bench.urllib.request.urlopen",
+            side_effect=[self._body(body), metrics],
+        ):
+            assert detect_engine("http://host:1", 10) == "vllm"
+
+    def test_unknown_engine_returns_empty(self) -> None:
+        body = {"data": [{"id": "m", "owned_by": "organization"}]}
+        metrics = io.BytesIO(b"# HELP python_info Python platform.\n")
+        with patch(
+            "llm_bench.spec_bench.urllib.request.urlopen",
+            side_effect=[self._body(body), metrics],
+        ):
             assert detect_engine("http://host:1", 10) == ""
 
     def test_unreachable_server_returns_empty(self) -> None:
@@ -413,6 +436,56 @@ class TestRunCompletionMeasuredTensorfold:
         ):
             r = run_completion_measured("http://host:1", "m", "hi", 8, 10)
         assert r.source == "sglang"
+
+
+class TestRunCompletionMeasuredVllm:
+    """vLLM /metrics path in run_completion_measured."""
+
+    def _vllm_snapshots(self) -> tuple[dict, dict]:
+        before = {
+            "vllm:time_to_first_token_seconds_sum": 1.0,
+            "vllm:time_to_first_token_seconds_count": 1.0,
+            "vllm:e2e_request_latency_seconds_sum": 3.0,
+            "vllm:e2e_request_latency_seconds_count": 1.0,
+            "vllm:prompt_tokens_total": 100.0,
+            "vllm:generation_tokens_total": 100.0,
+        }
+        after = {k: v + d for k, v, d in zip(
+            list(before), before.values(),
+            [0.5, 1.0, 2.5, 1.0, 1000.0, 200.0])}
+        return before, after
+
+    def test_reports_sglang_source_from_vllm_metrics(self) -> None:
+        before, after = self._vllm_snapshots()
+        client = _client_result()
+        with (
+            patch(
+                "llm_bench.spec_bench.snapshot_server_metrics",
+                side_effect=[before, after],
+            ),
+            patch("llm_bench.spec_bench.run_completion", return_value=client),
+        ):
+            r = run_completion_measured(
+                "http://host:1", "m", "hi", 8, 10, engine="vllm"
+            )
+        assert r.source == "sglang"
+        assert r.prompt_tok == 1000
+        assert r.gen_tok == 200
+
+    def test_snapshot_receives_vllm_prefix_and_names(self) -> None:
+        before, after = self._vllm_snapshots()
+        client = _client_result()
+        with (
+            patch(
+                "llm_bench.spec_bench.snapshot_server_metrics",
+                side_effect=[before, after],
+            ) as mock_snap,
+            patch("llm_bench.spec_bench.run_completion", return_value=client),
+        ):
+            run_completion_measured("http://host:1", "m", "hi", 8, 10, engine="vllm")
+        for call in mock_snap.call_args_list:
+            assert call.kwargs["prefix"] == "vllm:"
+            assert all(name.startswith("vllm:") for name in call.kwargs["required"])
 
 
 class TestWarmUp:
@@ -541,6 +614,18 @@ class TestParseMetricsText:
     def test_skips_unparseable_lines(self) -> None:
         values = parse_metrics_text("sglang:weird_metric not_a_number\n")
         assert values == {}
+
+    def test_parses_vllm_prefix_when_requested(self) -> None:
+        text = (
+            'vllm:prompt_tokens_total{engine="0",model_name="m"} 24.0\n'
+            "# HELP vllm:generation_tokens_total Number of generated tokens.\n"
+            'vllm:time_to_first_token_seconds_sum{engine="0"} 0.75\n'
+            'sglang:prompt_tokens_total{is_streaming="false"} 10.0\n'
+        )
+        values = parse_metrics_text(text, "vllm:")
+        assert values["vllm:prompt_tokens_total"] == 24.0
+        assert values["vllm:time_to_first_token_seconds_sum"] == 0.75
+        assert "sglang:prompt_tokens_total" not in values
 
 
 class TestSnapshotServerMetrics:

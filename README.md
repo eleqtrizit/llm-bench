@@ -53,9 +53,12 @@ Before measuring, the tool sends two short zero-context warmup requests so the
 server has the model fully loaded.
 
 Measured runs stream their response. When the server is SGLang with
-`--enable-metrics`, the tool snapshots `/metrics` before and after each
-single-request run and reports prefill and decode tok/s from the server's own
-counters (TTFT, end-to-end latency, prompt and generation token counters).
+`--enable-metrics` or vLLM with request stats logging left enabled, the tool
+snapshots `/metrics` before and after each single-request run and reports
+prefill and decode tok/s from the server's own counters (TTFT, end-to-end
+latency, prompt and generation token counters). The engine is detected from
+`owned_by` on `/v1/models`, with a `/metrics` sniff as a fallback, and the
+matching `sglang:` or `vllm:` metric family is used.
 When the server is TensorFold (detected by `owned_by: "tensorfold"` on
 `/v1/models`), the rates come from the engine's own telemetry block attached
 to each response (`prefill_s`, `decode_s`), and each row also shows the
