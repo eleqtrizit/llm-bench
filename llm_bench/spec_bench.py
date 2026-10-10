@@ -235,6 +235,7 @@ def run_completion(
     usage: Dict[str, int] | None = None
     timings: Dict[str, float] | None = None
     engine_stats: Dict[str, float] | None = None
+    spec_stats: Dict[str, float] = {}
     ttft = 0.0
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -256,6 +257,10 @@ def run_completion(
                 timings = chunk["timings"]
             if isinstance(chunk.get("tensorfold"), dict):
                 engine_stats = chunk["tensorfold"]
+            # Draft/accept counters moved to a sibling "speculative" block;
+            # older builds carry them inside the tensorfold block itself.
+            if isinstance(chunk.get("speculative"), dict):
+                spec_stats = chunk["speculative"]
             for choice in chunk.get("choices", []):
                 delta = choice.get("delta") or {}
                 # Reasoning deltas stream before content on thinking models;
@@ -281,13 +286,14 @@ def run_completion(
     draft_acceptance = 0.0
     prefill_tok_s = 0.0
     gen_tok_s = 0.0
-    if engine_stats and engine_stats.get("prefill_s") and engine_stats.get("decode_s"):
+    if engine_stats and (engine_stats.get("prefill_seconds") or engine_stats.get("prefill_s")) and (engine_stats.get("seconds") or engine_stats.get("decode_s")):
         # TensorFold reports its own prefill and decode wall time per request,
         # so both rates come from the server's accounting, not client timing.
-        prefill_s = float(engine_stats["prefill_s"])
-        decode_s = float(engine_stats["decode_s"])
-        drafted = float(engine_stats.get("drafted") or 0)
-        accepted = float(engine_stats.get("accepted") or 0)
+        prefill_s = float(engine_stats.get("prefill_seconds") or engine_stats.get("prefill_s"))
+        decode_s = float(engine_stats.get("seconds") or engine_stats.get("decode_s"))
+        draft_source = spec_stats or engine_stats
+        drafted = float(draft_source.get("drafted") or 0)
+        accepted = float(draft_source.get("accepted") or 0)
         prefill_tok_s = n_prompt / prefill_s if (n_prompt and prefill_s > 0) else 0.0
         gen_tok_s = n_gen / decode_s if decode_s > 0 else 0.0
         source = "tensorfold"
@@ -556,15 +562,51 @@ def query_models(base_url: str, timeout: int) -> List[str]:
     return models
 
 
+def probe_tensorfold(base_url: str, model: str, timeout: int) -> bool:
+    """Check whether completions for ``model`` carry a TensorFold telemetry block.
+
+    Sends a one-token streaming request and scans the raw SSE body for the
+    ``tensorfold`` key. Used when a proxy (for example llama-swap) masks the
+    backend engine in ``/v1/models`` and ``/metrics``.
+
+    Args:
+        base_url: Server root, for example ``http://127.0.0.1:8080``.
+        model: Model name as served by the endpoint.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        True when the response body contains a ``tensorfold`` block.
+    """
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "stream": True,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        base_url + "/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return b'"tensorfold"' in resp.read()
+
+
 def detect_engine(base_url: str, timeout: int) -> str:
     """Identify the serving engine behind an OpenAI-compatible endpoint.
 
     TensorFold signs every model entry in ``/v1/models`` with
     ``owned_by: "tensorfold"``; SGLang and vLLM sign theirs with the engine
     name. When the model list does not identify the engine, ``/metrics`` is
-    sniffed for the ``sglang:`` or ``vllm:`` family prefixes. Detection is
-    best effort: any failure to reach or parse the endpoints yields an empty
-    string and the bench falls back to client timing.
+    sniffed for the ``sglang:`` or ``vllm:`` family prefixes. When that also
+    fails (a proxy such as llama-swap re-signs models and serves its own
+    metrics), a tiny streaming request probes for the TensorFold telemetry
+    block. Detection is best effort: any failure to reach or parse the
+    endpoints yields an empty string and the bench falls back to client
+    timing.
 
     Args:
         base_url: Server root, for example ``http://127.0.0.1:8080``.
@@ -574,6 +616,7 @@ def detect_engine(base_url: str, timeout: int) -> str:
         The engine name: ``"tensorfold"``, ``"sglang"``, ``"vllm"``, or
         ``""`` when detection failed.
     """
+    first_model = ""
     try:
         req = urllib.request.Request(base_url + "/v1/models", method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -582,6 +625,8 @@ def detect_engine(base_url: str, timeout: int) -> str:
             owned_by = entry.get("owned_by")
             if owned_by == TENSORFOLD_ENGINE or owned_by in ENGINE_METRIC_PREFIXES:
                 return owned_by
+            if not first_model and entry.get("id"):
+                first_model = entry["id"]
     except Exception:  # noqa: BLE001 - detection is best effort
         pass
 
@@ -593,6 +638,14 @@ def detect_engine(base_url: str, timeout: int) -> str:
                 return engine
     except Exception:  # noqa: BLE001 - detection is best effort
         pass
+
+    # Proxies mask the backend: ask a completion directly.
+    if first_model:
+        try:
+            if probe_tensorfold(base_url, first_model, timeout):
+                return TENSORFOLD_ENGINE
+        except Exception:  # noqa: BLE001 - detection is best effort
+            pass
     return ""
 
 
@@ -1085,12 +1138,6 @@ def main(argv: List[str] | None = None) -> None:
     engine = detect_engine(base_url, args.timeout)
     engine_note = f" engine={engine}" if engine else " engine=unknown"
     print(f"llm-bench: {base_url}  model={model}{engine_note}")
-    print(
-        "throughput numbers come from the server's own /metrics"
-        " (SGLang or vLLM) when available, or the"
-        " TensorFold per-response telemetry block;"
-        " client timing is the fallback"
-    )
     print(f"gen_tokens={args.gen_tokens}, one run per context size")
     hdr = format_header()
     print("\n" + hdr)

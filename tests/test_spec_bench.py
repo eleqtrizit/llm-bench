@@ -32,6 +32,7 @@ from llm_bench.spec_bench import (
     parse_ctx,
     parse_metrics_text,
     parse_task,
+    probe_tensorfold,
     query_models,
     render_menu,
     run_completion,
@@ -348,6 +349,52 @@ class TestRunCompletion:
         assert r.source == "usage"
         assert r.draft_acceptance == 0.0
 
+    def test_reads_renamed_telemetry_keys_and_speculative_block(self) -> None:
+        # Exact shape served through llama-swap on vyper: prefill_seconds/
+        # seconds names, draft counters in a sibling "speculative" block.
+        chunks = [
+            {"choices": [{"delta": {"content": "ans"}}]},
+            {
+                "choices": [{"delta": {}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 17, "completion_tokens": 8},
+                "tensorfold": {
+                    "engine": "lanes",
+                    "tokens_per_second": 1165.27,
+                    "seconds": 0.027085224,
+                    "prefill_seconds": 0.021047919,
+                    "time_to_first_token": 0.021342127,
+                    "sampling": "exact",
+                },
+                "speculative": {
+                    "rounds": 1,
+                    "drafted": 7,
+                    "accepted": 7,
+                    "acceptance_rate": 1.0,
+                },
+            },
+        ]
+        resp = self._sse_body(chunks)
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
+            r = run_completion("http://host:1", "m", "hi", 8, 10)
+        assert r.source == TENSORFOLD_ENGINE
+        assert r.prefill_tok_s == pytest.approx(17 / 0.021047919)
+        assert r.gen_tok_s == pytest.approx(8 / 0.027085224)
+        assert r.draft_acceptance == pytest.approx(1.0)
+
+    def test_prefill_seconds_without_seconds_is_ignored(self) -> None:
+        chunks = [
+            {"choices": [{"delta": {"content": "a"}}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+                "tensorfold": {"prefill_seconds": 0.02},
+            },
+        ]
+        resp = self._sse_body(chunks)
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=resp):
+            r = run_completion("http://host:1", "m", "hi", 8, 10)
+        assert r.source == "usage"
+
 
 class TestDetectEngine:
     """detect_engine behavior."""
@@ -387,6 +434,33 @@ class TestDetectEngine:
             side_effect=[self._body(body), metrics],
         ):
             assert detect_engine("http://host:1", 10) == ""
+
+    def test_detects_tensorfold_behind_proxy_via_probe(self) -> None:
+        # llama-swap re-signs every model and serves its own /metrics.
+        body = {"data": [{"id": "nemo-lightning", "owned_by": "llama-swap"}]}
+        sse = b'data: {"choices": [], "tensorfold": {"seconds": 0.1}}\n\ndata: [DONE]\n'
+        with patch(
+            "llm_bench.spec_bench.urllib.request.urlopen",
+            side_effect=[
+                self._body(body),
+                io.BytesIO(b"# HELP llamaswap_cpu_util_percent CPU.\n"),
+                io.BytesIO(sse),
+            ],
+        ):
+            assert detect_engine("http://host:1", 10) == "tensorfold"
+
+    def test_probe_failure_falls_back_to_empty(self) -> None:
+        body = {"data": [{"id": "m", "owned_by": "llama-swap"}]}
+        with patch(
+            "llm_bench.spec_bench.urllib.request.urlopen",
+            side_effect=[self._body(body), self._body(body), RuntimeError("boom")],
+        ):
+            assert detect_engine("http://host:1", 10) == ""
+
+    def test_probe_tensorfold_scans_raw_stream(self) -> None:
+        sse = b'data: {"choices": [], "tensorfold": {"seconds": 0.1}}\n\ndata: [DONE]\n'
+        with patch("llm_bench.spec_bench.urllib.request.urlopen", return_value=io.BytesIO(sse)):
+            assert probe_tensorfold("http://host:1", "m", 10) is True
 
     def test_unreachable_server_returns_empty(self) -> None:
         def raise_url_error(*_: object) -> None:
