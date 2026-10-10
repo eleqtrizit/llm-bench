@@ -187,7 +187,12 @@ class RunResult:
 
 
 def run_completion(
-    base_url: str, model: str, prompt: str, gen_tokens: int, timeout: int
+    base_url: str,
+    model: str,
+    prompt: str,
+    gen_tokens: int,
+    timeout: int,
+    ignore_server_timings: bool = False,
 ) -> RunResult:
     """Run a single streaming chat completion and time its phases.
 
@@ -205,6 +210,9 @@ def run_completion(
         prompt: The user prompt text.
         gen_tokens: Maximum tokens to generate.
         timeout: Request timeout in seconds.
+        ignore_server_timings: When True, always compute prefill and decode
+            from client-side timing and skip server-reported counters
+            (TensorFold, llama.cpp timings).
 
     Returns:
         A :class:`RunResult` with both phase rates and their provenance.
@@ -286,11 +294,16 @@ def run_completion(
     draft_acceptance = 0.0
     prefill_tok_s = 0.0
     gen_tok_s = 0.0
-    if engine_stats and (engine_stats.get("prefill_seconds") or engine_stats.get("prefill_s")) and (engine_stats.get("seconds") or engine_stats.get("decode_s")):
+    if (
+        not ignore_server_timings
+        and engine_stats
+        and (engine_stats.get("prefill_seconds") or engine_stats.get("prefill_s"))
+        and (engine_stats.get("seconds") or engine_stats.get("decode_s"))
+    ):
         # TensorFold reports its own prefill and decode wall time per request,
         # so both rates come from the server's accounting, not client timing.
-        prefill_s = float(engine_stats.get("prefill_seconds") or engine_stats.get("prefill_s"))
-        decode_s = float(engine_stats.get("seconds") or engine_stats.get("decode_s"))
+        prefill_s = float(engine_stats.get("prefill_seconds") or engine_stats.get("prefill_s") or 0)
+        decode_s = float(engine_stats.get("seconds") or engine_stats.get("decode_s") or 0)
         draft_source = spec_stats or engine_stats
         drafted = float(draft_source.get("drafted") or 0)
         accepted = float(draft_source.get("accepted") or 0)
@@ -298,7 +311,7 @@ def run_completion(
         gen_tok_s = n_gen / decode_s if decode_s > 0 else 0.0
         source = "tensorfold"
         draft_acceptance = accepted / drafted if drafted > 0 else 0.0
-    elif timings and timings.get("prompt_n") and timings.get("prompt_ms"):
+    elif timings and not ignore_server_timings and timings.get("prompt_n") and timings.get("prompt_ms"):
         prompt_ms = float(timings["prompt_ms"])
         prefill_tok_s = timings["prompt_n"] / (prompt_ms / 1000.0)
         n_prompt = int(timings["prompt_n"])
@@ -473,6 +486,7 @@ def run_completion_measured(
     gen_tokens: int,
     timeout: int,
     engine: str = "",
+    ignore_server_timings: bool = False,
 ) -> RunResult:
     """Run one completion and report throughput from SGLang server metrics.
 
@@ -492,6 +506,8 @@ def run_completion_measured(
             the /metrics snapshot because TensorFold attaches its telemetry
             to each response instead, while ``sglang`` and ``vllm`` select
             the matching Prometheus family prefix for the deltas.
+        ignore_server_timings: When True, skip server metrics entirely and
+            compute prefill and decode from client-side timing.
 
     Returns:
         A :class:`RunResult`; ``source`` is ``sglang`` when server metrics
@@ -502,7 +518,14 @@ def run_completion_measured(
         urllib.error.URLError: If the server is unreachable or times out.
     """
     if engine == TENSORFOLD_ENGINE:
-        return run_completion(base_url, model, prompt, gen_tokens, timeout)
+        return run_completion(
+            base_url, model, prompt, gen_tokens, timeout, ignore_server_timings
+        )
+
+    if ignore_server_timings:
+        return run_completion(
+            base_url, model, prompt, gen_tokens, timeout, ignore_server_timings=True
+        )
 
     prefix = metric_prefix(engine)
     names = metric_full_names(engine)
@@ -517,7 +540,9 @@ def run_completion_measured(
             raise
         metrics_unavailable = e
 
-    result = run_completion(base_url, model, prompt, gen_tokens, timeout)
+    result = run_completion(
+        base_url, model, prompt, gen_tokens, timeout, ignore_server_timings
+    )
     if result.source == TENSORFOLD_ENGINE:
         return result
     if before is None:
@@ -947,6 +972,14 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--timeout", type=int, default=DEFAULT_TIMEOUT, help="request timeout seconds"
     )
+    ap.add_argument(
+        "--ignore-server-timings",
+        action="store_true",
+        help=(
+            "compute prefill and decode tok/s from client-side timing instead"
+            " of the inferencing server's reported numbers"
+        ),
+    )
     return ap.parse_args(argv)
 
 
@@ -1040,6 +1073,7 @@ def bench_lengths(
     gen_tokens: int,
     timeout: int,
     engine: str = "",
+    ignore_server_timings: bool = False,
 ) -> None:
     """Benchmark every selected task at each context size and print the rows.
 
@@ -1061,7 +1095,13 @@ def bench_lengths(
             prompt = build_prompt(ctx, TASKS[task])
             try:
                 result = run_completion_measured(
-                    base_url, model, prompt, gen_tokens, timeout, engine
+                    base_url,
+                    model,
+                    prompt,
+                    gen_tokens,
+                    timeout,
+                    engine,
+                    ignore_server_timings,
                 )
             except Exception as e:  # noqa: BLE001 - report and continue
                 print(f"{ctx:>8} {task:<6}   FAILED: {e}")
@@ -1151,6 +1191,7 @@ def main(argv: List[str] | None = None) -> None:
         args.gen_tokens,
         args.timeout,
         engine,
+        args.ignore_server_timings,
     )
 
 
