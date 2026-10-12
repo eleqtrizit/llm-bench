@@ -930,25 +930,26 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     Returns:
         The parsed argparse namespace.
     """
-    # We reclaim -h for --host, so the automatic -h/--help pair is disabled and
-    # help is re-added under the long form only.
     ap = argparse.ArgumentParser(
         prog="llm-bench",
         description="Benchmark tok/s on any OpenAI-compatible server.",
-        add_help=False,
+    )
+    ap.add_argument(
+        "base_url",
+        metavar="BASE_URL",
+        help=(
+            "server base URL, for example http://127.0.0.1:8000; a trailing"
+            " /v1 is accepted, and /v1 is also probed when the bare URL"
+            " does not answer"
+        ),
     )
     ap.add_argument(
         "--model",
         help="model name as served by the endpoint (omit to pick from /v1/models)",
     )
-    ap.add_argument("-h", "--host", required=True, help="server host")
-    ap.add_argument("-p", "--port", required=True, type=int, help="server port")
     ap.add_argument(
         "--api-key",
         help="API key sent as an Authorization: Bearer header on every request",
-    )
-    ap.add_argument(
-        "--help", action="help", default=argparse.SUPPRESS, help="show this help message and exit"
     )
     ap.add_argument(
         "--ctx",
@@ -985,6 +986,38 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         ),
     )
     return ap.parse_args(argv)
+
+
+def resolve_base_url(url: str, timeout: int) -> str:
+    """Normalize a user-supplied base URL to the server root without ``/v1``.
+
+    All request helpers in this module append ``/v1/...`` paths themselves,
+    so the internal base URL is the root. When the user already passed
+    ``/v1``, it is stripped. Otherwise the bare root is probed first, and
+    the URL with ``/v1`` appended second, in case the user forgot it.
+
+    Args:
+        url: User-supplied base URL, for example ``http://127.0.0.1:8000``.
+        timeout: Per-request timeout in seconds for the probes.
+
+    Returns:
+        The server root, for example ``http://127.0.0.1:8000``.
+
+    Raises:
+        SystemExit: If neither the bare URL nor ``<url>/v1`` is reachable.
+    """
+    url = url.rstrip("/")
+    if url.endswith("/v1"):
+        return url[: -len("/v1")]
+    try:
+        query_models(url, timeout)
+        return url
+    except Exception as bare_error:
+        try:
+            query_models(url + "/v1", timeout)
+        except Exception:
+            raise SystemExit(f"error: cannot reach server at {url}: {bare_error}") from None
+        return url + "/v1"
 
 
 WARMUP_PROMPT = "Say hello and nothing else."
@@ -1150,8 +1183,7 @@ def main(argv: List[str] | None = None) -> None:
     args = parse_args(argv)
     if args.api_key:
         install_api_key_handler(args.api_key)
-    host = f"[{args.host}]" if ":" in args.host else args.host
-    base_url = f"http://{host}:{args.port}"
+    base_url = resolve_base_url(args.base_url, args.timeout)
 
     model = args.model
     if model is None:

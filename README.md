@@ -13,7 +13,7 @@ uv tool install git+https://github.com/eleqtrizit/llm-bench
 Then run it against any OpenAI-compatible server:
 
 ```bash
-llm-bench --model <model> --host <host> --port <port>
+llm-bench --model <model> <base_url>
 ```
 
 ## Install as a global CLI
@@ -44,7 +44,7 @@ uv tool install git+https://github.com/eleqtrizit/llm-bench
 This puts `llm-bench` on your PATH. You can also run it without installing:
 
 ```bash
-uvx git+https://github.com/eleqtrizit/llm-bench --model <model> --host <host> --port <port>
+uvx git+https://github.com/eleqtrizit/llm-bench --model <model> <base_url>
 ```
 
 ## Usage
@@ -75,14 +75,14 @@ prefixes long enough for server-side prompt or KV-cache reuse. That keeps
 cache hits from inflating the prefill numbers.
 
 ```bash
-llm-bench --model qwen2.5-7b-instruct --host 127.0.0.1 --port 8080
+llm-bench --model qwen2.5-7b-instruct http://127.0.0.1:8080
 ```
 
 If you omit `--model`, the tool queries the server's `/v1/models` endpoint and
 shows a numbered menu to pick from:
 
 ```bash
-llm-bench --host 127.0.0.1 --port 8080
+llm-bench http://127.0.0.1:8080
 ```
 
 If you omit `--ctx`, the tool shows a multi-select menu. Move with the arrow
@@ -91,7 +91,7 @@ options are 2, 8, 32, 64, 128, and 200 (kilotokens). Pass `--ctx` to skip the
 menu:
 
 ```bash
-llm-bench --host 127.0.0.1 --port 8080 --ctx 2,8,16
+llm-bench http://127.0.0.1:8080 --ctx 2,8,16
 ```
 
 The `--task` flag picks what the model generates. The built-in tasks are
@@ -100,7 +100,7 @@ and LLMs). If you omit `--task`, a multi-select
 menu opens with the same spacebar controls; you must select at least one:
 
 ```bash
-llm-bench --host 127.0.0.1 --port 8080 --ctx 2,8 --task code,prose
+llm-bench http://127.0.0.1:8080 --ctx 2,8 --task code,prose
 ```
 
 Options:
@@ -108,8 +108,7 @@ Options:
 | Option | Description |
 | --- | --- |
 | `--model` | Model name as served by the endpoint (optional; omit to pick interactively from `/v1/models`) |
-| `-h`, `--host` | Server host (required) |
-| `-p`, `--port` | Server port (required) |
+| `BASE_URL` | Server base URL, for example `http://127.0.0.1:8080`. A trailing `/v1` is accepted, and `/v1` is probed if the bare URL does not answer (required) |
 | `--ctx` | Comma-separated context sizes in kilotokens, minimum 2, for example `2,8,16` (optional; omit to pick from the interactive menu) |
 | `--task` | Comma-separated generation tasks (`code`, `prose`; optional; omit to pick from the interactive menu) |
 | `--gen-tokens` | Max tokens generated per run (default `2048`) |

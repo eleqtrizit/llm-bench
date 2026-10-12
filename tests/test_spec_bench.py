@@ -36,6 +36,7 @@ from llm_bench.spec_bench import (
     probe_tensorfold,
     query_models,
     render_menu,
+    resolve_base_url,
     run_completion,
     run_completion_measured,
     snapshot_server_metrics,
@@ -82,31 +83,53 @@ class TestParseArgs:
     """parse_args behavior."""
 
     def test_required_args(self) -> None:
-        args = parse_args(["--model", "m", "--host", "10.0.0.5", "--port", "8080"])
+        args = parse_args(["--model", "m", "http://10.0.0.5:8080"])
         assert args.model == "m"
-        assert args.host == "10.0.0.5"
-        assert args.port == 8080
+        assert args.base_url == "http://10.0.0.5:8080"
         assert args.gen_tokens == 2048
 
-    def test_missing_host_exits(self) -> None:
+    def test_missing_base_url_exits(self) -> None:
         with pytest.raises(SystemExit):
-            parse_args(["--model", "m", "--port", "8080"])
-
-    def test_missing_model_exits(self) -> None:
-        with pytest.raises(SystemExit):
-            parse_args(["--port", "8080"])
+            parse_args(["--model", "m"])
 
     def test_custom_ctx(self) -> None:
-        args = parse_args(["--model", "m", "--host", "h", "--port", "1", "--ctx", "2,8,16"])
+        args = parse_args(["--model", "m", "http://h:1", "--ctx", "2,8,16"])
         assert args.ctx == [2, 8, 16]
 
     def test_invalid_ctx_exits(self) -> None:
         with pytest.raises(SystemExit):
-            parse_args(["--model", "m", "--host", "h", "--port", "1", "--ctx", "2,eight"])
+            parse_args(["--model", "m", "http://h:1", "--ctx", "2,eight"])
 
     def test_negative_ctx_exits(self) -> None:
         with pytest.raises(SystemExit):
-            parse_args(["--model", "m", "--host", "h", "--port", "1", "--ctx", "-4"])
+            parse_args(["--model", "m", "http://h:1", "--ctx", "-4"])
+
+
+class TestResolveBaseUrl:
+    """resolve_base_url behavior."""
+
+    def test_strips_trailing_v1(self) -> None:
+        with patch("llm_bench.spec_bench.query_models") as qm:
+            assert resolve_base_url("http://h:8000/v1/", 10) == "http://h:8000"
+        qm.assert_not_called()
+
+    def test_bare_url_reachable(self) -> None:
+        with patch("llm_bench.spec_bench.query_models") as qm:
+            qm.return_value = ["m"]
+            assert resolve_base_url("http://h:8000", 10) == "http://h:8000"
+            qm.assert_called_once_with("http://h:8000", 10)
+
+    def test_falls_back_to_v1_suffix(self) -> None:
+        with patch("llm_bench.spec_bench.query_models") as qm:
+            qm.side_effect = [urllib.error.URLError("no"), ["m"]]
+            assert resolve_base_url("http://h:8000", 10) == "http://h:8000/v1"
+            assert qm.call_args_list[1].args == ("http://h:8000/v1", 10)
+
+    def test_unreachable_exits(self) -> None:
+        with patch("llm_bench.spec_bench.query_models") as qm:
+            qm.side_effect = urllib.error.URLError("no")
+            with pytest.raises(SystemExit):
+                resolve_base_url("http://h:8000", 10)
 
 
 class TestMenuSelectCtx:
@@ -879,10 +902,10 @@ class TestApiKey:
     """Tests for --api-key parsing and header injection."""
 
     def test_parses_api_key(self) -> None:
-        args = parse_args(["-h", "localhost", "-p", "8000", "--api-key", "sekrit"])
+        args = parse_args(["http://localhost:8000", "--api-key", "sekrit"])
         assert args.api_key == "sekrit"
     def test_api_key_defaults_to_none(self) -> None:
-        args = parse_args(["-h", "localhost", "-p", "8000"])
+        args = parse_args(["http://localhost:8000"])
         assert args.api_key is None
 
     def test_handler_adds_bearer_header(self) -> None:
