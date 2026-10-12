@@ -944,6 +944,10 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     ap.add_argument("-h", "--host", required=True, help="server host")
     ap.add_argument("-p", "--port", required=True, type=int, help="server port")
     ap.add_argument(
+        "--api-key",
+        help="API key sent as an Authorization: Bearer header on every request",
+    )
+    ap.add_argument(
         "--help", action="help", default=argparse.SUPPRESS, help="show this help message and exit"
     )
     ap.add_argument(
@@ -1120,6 +1124,20 @@ def bench_lengths(
             )
 
 
+def install_api_key_handler(api_key: str) -> None:
+    """Install a global urllib opener that sends ``Authorization: Bearer``.
+
+    Args:
+        api_key: Secret sent on every request made through urllib.
+    """
+    handler = urllib.request.BaseHandler()
+    handler.http_request = lambda req: (
+        req.add_unredirected_header("Authorization", f"Bearer {api_key}") or req
+    )
+    handler.https_request = handler.http_request
+    urllib.request.install_opener(urllib.request.build_opener(handler))
+
+
 def main(argv: List[str] | None = None) -> None:
     """CLI entry point: run the benchmark against one OpenAI-compatible server.
 
@@ -1130,6 +1148,8 @@ def main(argv: List[str] | None = None) -> None:
         SystemExit: If the server cannot be reached.
     """
     args = parse_args(argv)
+    if args.api_key:
+        install_api_key_handler(args.api_key)
     host = f"[{args.host}]" if ":" in args.host else args.host
     base_url = f"http://{host}:{args.port}"
 

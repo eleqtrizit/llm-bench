@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from llm_bench.spec_bench import (
+    install_api_key_handler,
     METRIC_E2E_COUNT,
     METRIC_E2E_SUM,
     METRIC_GEN_TOKENS,
@@ -872,3 +873,23 @@ class TestRunCompletionMeasured:
             r = run_completion_measured("http://host:1", "m", "hi", 8, 10)
         assert r is client
         assert r.source == "usage"
+
+
+class TestApiKey:
+    """Tests for --api-key parsing and header injection."""
+
+    def test_parses_api_key(self) -> None:
+        args = parse_args(["-h", "localhost", "-p", "8000", "--api-key", "sekrit"])
+        assert args.api_key == "sekrit"
+    def test_api_key_defaults_to_none(self) -> None:
+        args = parse_args(["-h", "localhost", "-p", "8000"])
+        assert args.api_key is None
+
+    def test_handler_adds_bearer_header(self) -> None:
+        handler = urllib.request.BaseHandler()
+        handler.http_request = lambda req: (
+            req.add_unredirected_header("Authorization", "Bearer sekrit") or req
+        )
+        handler.https_request = handler.http_request
+        req = urllib.request.Request("http://localhost:8000/v1/models")
+        assert handler.http_request(req).get_header("Authorization") == "Bearer sekrit"
