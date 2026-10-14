@@ -2,9 +2,9 @@
 """llm-bench: benchmark tok/s on any OpenAI-compatible server.
 
 Benchmarks generation throughput (tok/s) at prompt/context lengths of
-2, 8, 32, 64, 128 and 200 kilotokens (or override with ``--ctx``). With
-``--parallel 2,4,8,16`` each combination also runs at that many concurrent
-requests, one table row per concurrent request.
+2, 8, 32, 64, 128 and 200 kilotokens (or override with ``--ctx``). Runs
+use 1, 2, 4, 8, or 16 threads per run (``--parallel``); every run prints
+one row, and multithreaded rows combine the per-thread rates.
 """
 
 from __future__ import annotations
@@ -28,10 +28,10 @@ DEFAULT_CTX_OPTIONS = [2, 8, 32, 64, 128, 200]
 # only exercise the decode path with no real prefill work.
 MIN_CTX_K = 2
 
-# Concurrency levels accepted by --parallel. Each level runs that many
-# streaming requests at once for every context/task combination and reports
-# the aggregate rate for the batch.
-PARALLEL_OPTIONS = (2, 4, 8, 16)
+# Threads per run accepted by --parallel. Level 1 is a single request;
+# higher levels run that many streaming requests at once for every
+# context/task combination and combine the per-thread rates in one row.
+PARALLEL_OPTIONS = (1, 2, 4, 8, 16)
 
 # Prometheus metrics used for server-reported throughput numbers. The
 # bench snapshots /metrics before and after each single-request run and reads
@@ -823,12 +823,17 @@ def menu_line_count(num_labels: int) -> int:
 
 
 def menu_multi_select(
-    labels: List[str], title: str, allow_empty: bool, empty_hint: str = ""
+    labels: List[str],
+    title: str,
+    allow_empty: bool,
+    empty_hint: str = "",
+    initially_selected: set[int] | None = None,
 ) -> set[int] | None:
     """Show an interactive multi-select menu and return the chosen indices.
 
-    All options start selected. Space toggles the option under the cursor,
-    ``a`` toggles all, enter confirms, and ``q`` aborts.
+    All options start selected unless :arg:`initially_selected` narrows the
+    preselection. Space toggles the option under the cursor, ``a`` toggles
+    all, enter confirms, and ``q`` aborts.
 
     Args:
         labels: The text shown for each option.
@@ -837,6 +842,7 @@ def menu_multi_select(
             confirming.
         empty_hint: Message shown when confirming an empty selection is not
             allowed.
+        initially_selected: Indices preselected at start; None selects all.
 
     Returns:
         The chosen option indices, or None when the user quits.
@@ -848,7 +854,11 @@ def menu_multi_select(
     if not sys.stdin.isatty():
         raise ValueError("no terminal attached; use the --ctx/--task flags instead")
     rows_len = menu_line_count(len(labels))
-    selected: set[int] = set(range(len(labels)))
+    selected: set[int] = (
+        initially_selected
+        if initially_selected is not None
+        else set(range(len(labels)))
+    )
     cursor = 0
     print(render_menu(labels, selected, cursor, True, title), end="", flush=True)
     while True:
@@ -923,23 +933,24 @@ def menu_select_tasks() -> List[str] | None:
 
 
 def menu_select_parallel() -> List[int] | None:
-    """Show the interactive concurrency-level multi-select menu.
+    """Show the interactive threads-per-run multi-select menu.
 
-    All levels start selected; toggle everything off for single-request
-    runs, which is what an empty selection means.
+    Only level 1 starts selected, so pressing enter alone runs the classic
+    single-request benchmark.
 
     Returns:
-        The chosen concurrency levels from :data:`PARALLEL_OPTIONS`, an
-        empty list meaning single-request runs, or None when the user quits.
+        The chosen concurrency levels from :data:`PARALLEL_OPTIONS`, or
+        None when the user quits.
     """
     if not sys.stdin.isatty():
-        raise ValueError("no terminal attached; pass --parallel 2,4,8,16")
+        raise ValueError("no terminal attached; pass --parallel 1,2,4,8,16")
     chosen = menu_multi_select(
         [str(level) for level in PARALLEL_OPTIONS],
-        "Select concurrency levels, in simultaneous requests"
-        " (space: toggle, up/down: move, a: all/none, enter: start,"
-        " q: quit; select none for single-request runs)",
-        allow_empty=True,
+        "Select threads per run, in simultaneous requests"
+        " (space: toggle, up/down: move, a: all/none, enter: start, q: quit)",
+        allow_empty=False,
+        empty_hint="Select at least one threads level.",
+        initially_selected={0},
     )
     if chosen is None:
         return None
@@ -1073,11 +1084,12 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         type=parse_parallel,
         metavar="LEVELS",
         help=(
-            "comma-separated concurrent request levels, one of 2, 4, 8, 16"
-            " per level, for example 2,4,8,16; every level runs each"
-            " context/task combination with that many simultaneous requests,"
-            " one results row per request (omit to pick from an interactive"
-            " menu when a terminal is attached; otherwise a single request)"
+            "comma-separated threads per run, one of 1, 2, 4, 8, 16, for"
+            " example 2,4,8,16; every level runs each context/task"
+            " combination with that many simultaneous requests and reports"
+            " one row with prefill and tok/s combined across threads"
+            " (omit to pick from an interactive menu when a terminal is"
+            " attached; otherwise a single request)"
         ),
     )
     ap.add_argument(
@@ -1165,8 +1177,8 @@ def format_header() -> str:
         The fixed-width header line; its length matches the dash separator.
     """
     return (
-        f"{'ctx':>8} {'task':<6} {'prompt_tok':>13} {'gen_tok':>10} "
-        f"{'prefill tok/s':>16} {'tok/s':>12}"
+        f"{'ctx':>8} {'task':<6} {'threads':>7} {'prompt_tok':>13} "
+        f"{'gen_tok':>10} {'prefill tok/s':>16} {'tok/s':>12}"
     )
 
 
@@ -1179,23 +1191,28 @@ def format_row(
     tok_s: float,
     source: str = "usage",
     draft_acceptance: float = 0.0,
-    parallel: int = 1,
+    threads: int = 1,
 ) -> str:
     """Build one aligned results-table row.
 
     Args:
         ctx_k: The context size of this row, in kilotokens.
         task: The generation task of this row.
-        prompt_tok: Prompt tokens reported by the server for this run.
-        gen_tok: Completion tokens generated in this run.
+        prompt_tok: Prompt tokens reported by the server for this run;
+            for multithreaded runs, the combined total across threads.
+        gen_tok: Completion tokens generated in this run; for
+            multithreaded runs, the combined total across threads.
         prefill_tok_s: Estimated prefill throughput; 0.0 means unknown.
+            For multithreaded runs, the combined total of the per-thread
+            rates.
         tok_s: Generation throughput of this run in tokens per second.
+            For multithreaded runs, the combined total of the per-thread
+            rates.
         source: Provenance of the rates; ``estimated`` rows get an asterisk
             on the throughput columns.
         draft_acceptance: TensorFold speculative-draft acceptance rate; when
             above 0 a ``draft=NN%`` note is appended to the row.
-        parallel: Concurrency level of the batch this request ran in; when
-            above 1 a ``par=N`` note is appended to the row.
+        threads: Number of concurrent requests this row reports on.
 
     Returns:
         The formatted row, aligned with the header columns. Unknown prefill
@@ -1209,13 +1226,11 @@ def format_row(
     else:
         tok_str = f"{tok_s:.2f}"
     row = (
-        f"{ctx_str:>8} {task:<6} {prompt_tok:>13} {gen_tok:>10} "
+        f"{ctx_str:>8} {task:<6} {threads:>7} {prompt_tok:>13} {gen_tok:>10} "
         f"{prefill_str:>16} {tok_str:>12}"
     )
     if draft_acceptance > 0:
         row += f"  draft={draft_acceptance:.0%}"
-    if parallel > 1:
-        row += f"  par={parallel}"
     return row
 
 
@@ -1232,11 +1247,13 @@ def bench_lengths(
 ) -> None:
     """Benchmark every selected task at each context size and print the rows.
 
-    Concurrent runs (levels above 1) print one row per concurrent request,
-    each tagged ``par=N`` with its batch size and showing that request's
-    own client-measured token counts and phase rates. The single-request
-    server-metrics path cannot attribute its per-request deltas to a batch,
-    so concurrent rows always use client-side timing.
+    Every run prints one row with its thread count in the ``threads``
+    column. Level 1 keeps the single-request server-metrics path; higher
+    levels print one combined row per batch, with token counts totaled
+    across threads and prefill and tok/s the combined total of the
+    per-thread client-measured rates. The single-request server-metrics
+    path cannot attribute its per-request deltas to a batch, so
+    concurrent runs always use client-side timing.
 
     Args:
         base_url: Server root, for example ``http://127.0.0.1:8080``.
@@ -1247,7 +1264,7 @@ def bench_lengths(
         timeout: Request timeout in seconds.
         engine: Engine name from :func:`detect_engine`, for the measured path
             to select the server-metrics mechanism.
-        parallel: Concurrency levels per :data:`PARALLEL_OPTIONS`; None or
+        parallel: Threads per run per :data:`PARALLEL_OPTIONS`; None or
             ``[1]`` runs a single request per combination.
 
     Returns:
@@ -1280,7 +1297,7 @@ def bench_lengths(
                         ignore_server_timings,
                     )
                 except Exception as e:  # noqa: BLE001 - report and continue
-                    print(f"{ctx:>8} {task:<6}   FAILED: {e}")
+                    print(f"{ctx:>8} {task:<6} {1:>7}   FAILED: {e}")
                     continue
                 print(
                     format_row(
@@ -1307,12 +1324,15 @@ def _bench_parallel_run(
 ) -> None:
     """Run one context/task combination at one concurrency level and print it.
 
-    Every concurrent request gets its own row, tagged ``par=N`` with its
-    batch size, showing that request's own token counts and client-measured
-    phase rates. The single-request server-metrics path cannot attribute
-    its per-request deltas to a batch, so concurrent runs always measure
-    with :func:`run_completion` client timing. A failure in any request
-    fails the whole batch and prints one ``FAILED`` row.
+    One row reports the whole batch: token counts are totaled across
+    threads, prefill and tok/s are the combined total of the per-thread
+    client-measured rates, and draft acceptance is averaged across threads
+    that report one. The row keeps the per-request source when every
+    thread agrees on it, otherwise it is marked ``estimated``. The
+    single-request server-metrics path cannot attribute its per-request
+    deltas to a batch, so concurrent runs always measure with
+    :func:`run_completion` client timing. A failure in any request fails
+    the whole batch and prints a ``FAILED`` row.
 
     Args:
         base_url: Server root, for example ``http://127.0.0.1:8080``.
@@ -1324,28 +1344,35 @@ def _bench_parallel_run(
         timeout: Request timeout in seconds.
 
     Returns:
-        None. One row per request, or a ``FAILED`` line, is printed.
+        None. The combined row or a ``FAILED`` line is printed.
     """
     try:
         prompts = [build_prompt(ctx, TASKS[task]) for _ in range(parallel)]
         results = run_parallel_batch(base_url, model, prompts, gen_tokens, timeout)
     except Exception as e:  # noqa: BLE001 - report and continue
-        print(f"{ctx:>8} {task:<6}   FAILED: {e}")
+        print(f"{ctx:>8} {task:<6} {parallel:>7}   FAILED: {e}")
         return
-    for result in results:
-        print(
-            format_row(
-                ctx,
-                task,
-                result.prompt_tok,
-                result.gen_tok,
-                result.prefill_tok_s,
-                result.gen_tok_s,
-                result.source,
-                result.draft_acceptance,
-                parallel=parallel,
-            )
+    prompt_tok = sum(r.prompt_tok for r in results)
+    gen_tok = sum(r.gen_tok for r in results)
+    prefill_tok_s = sum(r.prefill_tok_s for r in results)
+    tok_s = sum(r.gen_tok_s for r in results)
+    sources = {r.source for r in results}
+    source = sources.pop() if len(sources) == 1 else "estimated"
+    drafts = [r.draft_acceptance for r in results if r.draft_acceptance > 0]
+    draft_acceptance = sum(drafts) / len(drafts) if drafts else 0.0
+    print(
+        format_row(
+            ctx,
+            task,
+            prompt_tok,
+            gen_tok,
+            prefill_tok_s,
+            tok_s,
+            source,
+            draft_acceptance,
+            threads=parallel,
         )
+    )
 
 
 class BearerAuthHandler(urllib.request.BaseHandler):
@@ -1445,8 +1472,8 @@ def main(argv: List[str] | None = None) -> None:
     runs_note = (
         "one run per context size"
         if parallel == [1]
-        else f"parallel levels {','.join(map(str, parallel))},"
-        " one row per concurrent request"
+        else f"threads {','.join(map(str, parallel))},"
+        " prefill and tok/s combined across threads"
     )
     print(f"gen_tokens={args.gen_tokens}, {runs_note}")
     hdr = format_header()

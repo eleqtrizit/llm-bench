@@ -213,20 +213,21 @@ class TestChooseModel:
 class TestTableFormatting:
     """format_header and format_row alignment behavior."""
 
-    def test_row_has_five_columns(self) -> None:
+    def test_row_has_six_columns(self) -> None:
         row = format_row(8, "prose", 155, 81, 900.0, 152.65)
         cols = row.split()
-        assert cols == ["8k", "prose", "155", "81", "900.00", "152.65"]
+        assert cols == ["8k", "prose", "1", "155", "81", "900.00", "152.65"]
 
     def test_row_shows_dash_for_unknown_prefill(self) -> None:
         row = format_row(0, "prose", 20, 93, 0.0, 191.65)
-        assert row.split()[4] == "-"
+        assert row.split()[5] == "-"
 
     def test_tok_s_header_and_value_share_right_edge(self) -> None:
         header = format_header()
         row = format_row(0, "prose", 20, 93, 900.0, 191.65)
         assert header.split() == [
-            "ctx", "task", "prompt_tok", "gen_tok", "prefill", "tok/s", "tok/s"
+            "ctx", "task", "threads", "prompt_tok", "gen_tok",
+            "prefill", "tok/s", "tok/s",
         ]
         header_end = header.rindex("tok/s") + len("tok/s")
         row_end = row.index("191.65") + len("191.65")
@@ -240,13 +241,13 @@ class TestTableFormatting:
         row = format_row(0, "code", 20, 93, 900.0, 191.65)
         assert "draft" not in row
 
-    def test_row_appends_parallel_note_when_above_one(self) -> None:
-        row = format_row(0, "code", 20, 93, 900.0, 191.65, parallel=4)
-        assert row.endswith("par=4")
+    def test_row_shows_thread_count(self) -> None:
+        row = format_row(0, "code", 20, 93, 900.0, 191.65, threads=4)
+        assert row.split()[2] == "4"
 
-    def test_row_has_no_parallel_note_when_single(self) -> None:
+    def test_row_defaults_to_one_thread(self) -> None:
         row = format_row(0, "code", 20, 93, 900.0, 191.65)
-        assert "par=" not in row
+        assert row.split()[2] == "1"
 
 
 class TestRunCompletion:
@@ -695,16 +696,18 @@ class TestMenuSelectParallel:
         with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
             fake_stdin.isatty.return_value = True
             with patch(
-                "llm_bench.spec_bench.menu_multi_select", return_value={0, 3}
+                "llm_bench.spec_bench.menu_multi_select", return_value={0, 4}
             ) as menu:
-                assert menu_select_parallel() == [2, 16]
-            assert menu.call_args.kwargs["allow_empty"] is True
+                assert menu_select_parallel() == [1, 16]
+            assert menu.call_args.kwargs["allow_empty"] is False
 
-    def test_empty_selection_means_single_request(self) -> None:
+    def test_level_1_is_the_default_selection(self) -> None:
         with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
             fake_stdin.isatty.return_value = True
-            with patch("llm_bench.spec_bench.menu_multi_select", return_value=set()):
-                assert menu_select_parallel() == []
+            with patch("llm_bench.spec_bench.menu_multi_select") as menu:
+                menu.return_value = {0}
+                assert menu_select_parallel() == [1]
+            assert menu.call_args.kwargs["initially_selected"] == {0}
 
     def test_quit_returns_none(self) -> None:
         with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
@@ -963,7 +966,10 @@ class TestParseParallel:
     """parse_parallel and --parallel argument behavior."""
 
     def test_parses_comma_separated_levels(self) -> None:
-        assert parse_parallel("2,4,8,16") == [2, 4, 8, 16]
+        assert parse_parallel("1,2,4,8,16") == [1, 2, 4, 8, 16]
+
+    def test_single_request_level_is_valid(self) -> None:
+        assert parse_parallel("1") == [1]
 
     def test_single_level(self) -> None:
         assert parse_parallel("8") == [8]
@@ -984,8 +990,8 @@ class TestParseParallel:
         assert args.parallel is None
 
     def test_custom_parallel(self) -> None:
-        args = parse_args(["--model", "m", "http://h:1", "--parallel", "2,4,8,16"])
-        assert args.parallel == [2, 4, 8, 16]
+        args = parse_args(["--model", "m", "http://h:1", "--parallel", "1,2,4,8,16"])
+        assert args.parallel == [1, 2, 4, 8, 16]
 
     def test_invalid_parallel_exits(self) -> None:
         with pytest.raises(SystemExit):
@@ -1037,7 +1043,7 @@ class TestRunParallelBatch:
 class TestBenchLengthsParallel:
     """bench_lengths concurrency-level reporting."""
 
-    def test_parallel_run_prints_one_row_per_request(self, capsys) -> None:
+    def test_parallel_run_prints_one_combined_row(self, capsys) -> None:
         results = [
             RunResult(40.0, 90.0, 1000, 500, 0.5, "usage"),
             RunResult(50.0, 80.0, 1100, 400, 0.6, "usage"),
@@ -1049,20 +1055,16 @@ class TestBenchLengthsParallel:
         ):
             bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
         out = capsys.readouterr().out
-        rows = [line for line in out.splitlines() if "par=2" in line]
-        assert len(rows) == 2
-        assert rows[0].endswith("par=2")
-        assert f"{1000:>13}" in rows[0]
-        assert f"{500:>10}" in rows[0]
-        assert "40.00" in rows[0] and "90.00" in rows[0]
-        assert f"{1100:>13}" in rows[1]
-        assert f"{400:>10}" in rows[1]
-        assert "50.00" in rows[1] and "80.00" in rows[1]
+        data = [line for line in out.splitlines() if line.strip().startswith("2k")]
+        assert len(data) == 1
+        assert data[0].split() == [
+            "2k", "code", "2", "2100", "900", "90.00", "170.00"
+        ]
 
-    def test_parallel_rows_show_each_requests_source(self, capsys) -> None:
+    def test_mixed_sources_are_flagged_estimated(self, capsys) -> None:
         results = [
             RunResult(40.0, 90.0, 1000, 500, 0.5, "usage"),
-            RunResult(40.0, 90.0, 1000, 500, 0.5, "estimated"),
+            RunResult(40.0, 80.0, 1000, 500, 0.5, "estimated"),
         ]
         with patch(
             "llm_bench.spec_bench.run_completion", side_effect=results
@@ -1071,14 +1073,13 @@ class TestBenchLengthsParallel:
         ):
             bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
         out = capsys.readouterr().out
-        rows = [line for line in out.splitlines() if "par=2" in line]
-        assert "*" not in rows[0]
-        assert "*" in rows[1]  # chunk-counted fallback is asterisked
+        assert "80.00*" in out  # summed prefill, asterisked
+        assert "170.00*" in out  # summed tok/s, asterisked
 
-    def test_parallel_rows_carry_draft_acceptance(self, capsys) -> None:
+    def test_draft_acceptance_is_averaged_across_threads(self, capsys) -> None:
         results = [
             RunResult(40.0, 90.0, 1000, 500, 0.5, "tensorfold", 0.6),
-            RunResult(40.0, 90.0, 1000, 500, 0.5, "tensorfold", 0.6),
+            RunResult(40.0, 90.0, 1000, 500, 0.5, "tensorfold", 0.8),
         ]
         with patch(
             "llm_bench.spec_bench.run_completion", side_effect=results
@@ -1087,8 +1088,21 @@ class TestBenchLengthsParallel:
         ):
             bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
         out = capsys.readouterr().out
-        assert "draft=60%" in out
-        assert "par=2" in out
+        assert "draft=70%" in out  # mean of 60% and 80%
+
+    def test_shared_source_is_kept(self, capsys) -> None:
+        results = [
+            RunResult(40.0, 90.0, 1000, 500, 0.5, "timings"),
+            RunResult(40.0, 80.0, 1000, 500, 0.5, "timings"),
+        ]
+        with patch(
+            "llm_bench.spec_bench.run_completion", side_effect=results
+        ), patch(
+            "llm_bench.spec_bench.build_prompt", side_effect=lambda *args: "p"
+        ):
+            bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
+        out = capsys.readouterr().out
+        assert "*" not in out  # not estimated: every thread reported timings
 
     def test_parallel_failure_prints_failed_row(self, capsys) -> None:
         with patch(
@@ -1097,7 +1111,7 @@ class TestBenchLengthsParallel:
             bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
         out = capsys.readouterr().out
         assert "FAILED" in out
-        assert "par=" not in out
+        assert "       2 code         2   FAILED: boom" in out
 
     def test_single_run_keeps_measured_path(self, capsys) -> None:
         single = RunResult(40.0, 100.0, 1000, 500, 0.5, "usage")
@@ -1110,4 +1124,5 @@ class TestBenchLengthsParallel:
         out = capsys.readouterr().out
         measured.assert_called_once()
         client.assert_not_called()
-        assert "par=" not in out
+        data = [line for line in out.splitlines() if line.strip().startswith("2k")]
+        assert data[0].split()[2] == "1"  # threads column shows 1
