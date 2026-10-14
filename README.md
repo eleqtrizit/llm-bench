@@ -106,13 +106,14 @@ llm-bench http://127.0.0.1:8080 --ctx 2,8 --task code,prose
 The `--parallel` flag sets how many requests run at once. The allowed levels
 are 2, 4, 8, and 16, comma-separated to sweep several levels in one run. Each
 level runs every selected context/task combination with that many
-simultaneous requests and reports one aggregate row tagged `par=N`: prompt
-and generated token counts are batch totals, prefill is the total prompt
-tokens over the slowest time to first token, and tok/s is the batch's total
-generated tokens over the run's wall time. Concurrent rows use client-side
-timing because the single-request server-metrics path cannot attribute its
-per-request deltas to a batch. Omitting `--parallel` keeps single-request
-runs:
+simultaneous requests, and every request reports its own row: the row shows
+that request's prompt and generated tokens and its client-measured prefill
+and decode rates, tagged `par=N` with its batch size. Concurrent rows use
+client-side timing because the single-request server-metrics path cannot
+attribute its per-request deltas to a batch. Omit the flag on a terminal and
+a multi-select menu opens with the same spacebar controls as the context
+menu; all levels start selected, and selecting none keeps single-request
+runs. Without a terminal, omitting the flag also means a single request:
 
 ```bash
 llm-bench http://127.0.0.1:8080 --ctx 2,8 --task code --parallel 2,4,8,16
@@ -126,7 +127,7 @@ Options:
 | `BASE_URL` | Server base URL, for example `http://127.0.0.1:8080`. A trailing `/v1` is accepted, and `/v1` is probed if the bare URL does not answer (required) |
 | `--ctx` | Comma-separated context sizes in kilotokens, minimum 2, for example `2,8,16` (optional; omit to pick from the interactive menu) |
 | `--task` | Comma-separated generation tasks (`code`, `prose`; optional; omit to pick from the interactive menu) |
-| `--parallel` | Comma-separated concurrent request levels, each one of 2, 4, 8, 16, for example `2,4,8,16`; every level runs each context/task combination with that many simultaneous requests and reports aggregate tok/s (optional; default: a single request) |
+| `--parallel` | Comma-separated concurrent request levels, each one of 2, 4, 8, 16, for example `2,4,8,16`; every level runs each context/task combination with that many simultaneous requests and reports aggregate tok/s (optional; omit to pick from the interactive menu, or for single-request runs when no terminal is attached) |
 | `--gen-tokens` | Max tokens generated per run (default `2048`) |
 | `--timeout` | Request timeout in seconds (default `600`) |
 

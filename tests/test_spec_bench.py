@@ -29,6 +29,7 @@ from llm_bench.spec_bench import (
     format_header,
     format_row,
     menu_select_ctx,
+    menu_select_parallel,
     menu_select_tasks,
     metrics_to_rates,
     parse_args,
@@ -681,6 +682,37 @@ class TestMenuSelectTasks:
                 menu_select_ctx([2, 8])
 
 
+class TestMenuSelectParallel:
+    """menu_select_parallel behavior."""
+
+    def test_requires_tty(self) -> None:
+        with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
+            fake_stdin.isatty.return_value = False
+            with pytest.raises(ValueError, match="--parallel"):
+                menu_select_parallel()
+
+    def test_returns_selected_levels(self) -> None:
+        with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
+            fake_stdin.isatty.return_value = True
+            with patch(
+                "llm_bench.spec_bench.menu_multi_select", return_value={0, 3}
+            ) as menu:
+                assert menu_select_parallel() == [2, 16]
+            assert menu.call_args.kwargs["allow_empty"] is True
+
+    def test_empty_selection_means_single_request(self) -> None:
+        with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
+            fake_stdin.isatty.return_value = True
+            with patch("llm_bench.spec_bench.menu_multi_select", return_value=set()):
+                assert menu_select_parallel() == []
+
+    def test_quit_returns_none(self) -> None:
+        with patch("llm_bench.spec_bench.sys.stdin") as fake_stdin:
+            fake_stdin.isatty.return_value = True
+            with patch("llm_bench.spec_bench.menu_multi_select", return_value=None):
+                assert menu_select_parallel() is None
+
+
 def _client_result(**overrides: object) -> RunResult:
     """Build a representative client-measured RunResult for tests."""
     fields = {
@@ -1005,34 +1037,58 @@ class TestRunParallelBatch:
 class TestBenchLengthsParallel:
     """bench_lengths concurrency-level reporting."""
 
-    def _result(self) -> RunResult:
-        return RunResult(40.0, 100.0, 1000, 500, 0.5, "usage")
-
-    def test_parallel_run_prints_aggregate_row(self, capsys) -> None:
-        def fake(*args) -> RunResult:
-            return self._result()
-
-        with patch("llm_bench.spec_bench.run_completion", side_effect=fake):
-            bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
-        out = capsys.readouterr().out
-        assert "par=2" in out
-        assert f"{2000:>13}" in out  # total prompt tokens
-        assert f"{1000:>10}" in out  # total generated tokens
-        assert "4000.00" in out  # aggregate prefill: 2000 / 0.5 slowest TTFT
-
-    def test_parallel_run_flags_mixed_token_sources(self, capsys) -> None:
+    def test_parallel_run_prints_one_row_per_request(self, capsys) -> None:
         results = [
-            RunResult(40.0, 100.0, 1000, 500, 0.5, "usage"),
-            RunResult(40.0, 100.0, 1000, 500, 0.5, "estimated"),
+            RunResult(40.0, 90.0, 1000, 500, 0.5, "usage"),
+            RunResult(50.0, 80.0, 1100, 400, 0.6, "usage"),
         ]
         with patch(
             "llm_bench.spec_bench.run_completion", side_effect=results
         ), patch(
-            "llm_bench.spec_bench.build_prompt", side_effect=lambda *a: "p"
+            "llm_bench.spec_bench.build_prompt", side_effect=lambda *args: "p"
         ):
             bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
         out = capsys.readouterr().out
-        assert "*" in out  # estimated rows are asterisked
+        rows = [line for line in out.splitlines() if "par=2" in line]
+        assert len(rows) == 2
+        assert rows[0].endswith("par=2")
+        assert f"{1000:>13}" in rows[0]
+        assert f"{500:>10}" in rows[0]
+        assert "40.00" in rows[0] and "90.00" in rows[0]
+        assert f"{1100:>13}" in rows[1]
+        assert f"{400:>10}" in rows[1]
+        assert "50.00" in rows[1] and "80.00" in rows[1]
+
+    def test_parallel_rows_show_each_requests_source(self, capsys) -> None:
+        results = [
+            RunResult(40.0, 90.0, 1000, 500, 0.5, "usage"),
+            RunResult(40.0, 90.0, 1000, 500, 0.5, "estimated"),
+        ]
+        with patch(
+            "llm_bench.spec_bench.run_completion", side_effect=results
+        ), patch(
+            "llm_bench.spec_bench.build_prompt", side_effect=lambda *args: "p"
+        ):
+            bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
+        out = capsys.readouterr().out
+        rows = [line for line in out.splitlines() if "par=2" in line]
+        assert "*" not in rows[0]
+        assert "*" in rows[1]  # chunk-counted fallback is asterisked
+
+    def test_parallel_rows_carry_draft_acceptance(self, capsys) -> None:
+        results = [
+            RunResult(40.0, 90.0, 1000, 500, 0.5, "tensorfold", 0.6),
+            RunResult(40.0, 90.0, 1000, 500, 0.5, "tensorfold", 0.6),
+        ]
+        with patch(
+            "llm_bench.spec_bench.run_completion", side_effect=results
+        ), patch(
+            "llm_bench.spec_bench.build_prompt", side_effect=lambda *args: "p"
+        ):
+            bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
+        out = capsys.readouterr().out
+        assert "draft=60%" in out
+        assert "par=2" in out
 
     def test_parallel_failure_prints_failed_row(self, capsys) -> None:
         with patch(
@@ -1044,8 +1100,9 @@ class TestBenchLengthsParallel:
         assert "par=" not in out
 
     def test_single_run_keeps_measured_path(self, capsys) -> None:
+        single = RunResult(40.0, 100.0, 1000, 500, 0.5, "usage")
         with patch(
-            "llm_bench.spec_bench.run_completion_measured", return_value=self._result()
+            "llm_bench.spec_bench.run_completion_measured", return_value=single
         ) as measured, patch(
             "llm_bench.spec_bench.run_completion"
         ) as client:
