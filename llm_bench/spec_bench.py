@@ -2,12 +2,15 @@
 """llm-bench: benchmark tok/s on any OpenAI-compatible server.
 
 Benchmarks generation throughput (tok/s) at prompt/context lengths of
-2, 8, 16, 32, 64 and 128 tokens (or override with ``--lengths``).
+2, 8, 32, 64, 128 and 200 kilotokens (or override with ``--ctx``). With
+``--parallel 2,4,8,16`` each combination also runs at that many concurrent
+requests and reports the aggregate rate.
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import random
@@ -24,6 +27,11 @@ DEFAULT_CTX_OPTIONS = [2, 8, 32, 64, 128, 200]
 # The smallest measurable context size, in kilotokens. Runs below this floor
 # only exercise the decode path with no real prefill work.
 MIN_CTX_K = 2
+
+# Concurrency levels accepted by --parallel. Each level runs that many
+# streaming requests at once for every context/task combination and reports
+# the aggregate rate for the batch.
+PARALLEL_OPTIONS = (2, 4, 8, 16)
 
 # Prometheus metrics used for server-reported throughput numbers. The
 # bench snapshots /metrics before and after each single-request run and reads
@@ -338,6 +346,48 @@ def run_completion(
         source=source,
         draft_acceptance=draft_acceptance,
     )
+
+
+def run_parallel_batch(
+    base_url: str,
+    model: str,
+    prompts: List[str],
+    gen_tokens: int,
+    timeout: int,
+) -> List[RunResult]:
+    """Run one streaming completion per prompt, all in flight at once.
+
+    The pool has one worker per prompt, so every request overlaps. Each
+    prompt must be unique (see :func:`build_prompt`) so concurrent requests
+    cannot hit a server-side prompt or KV cache and skew the rates. The
+    server-metrics path only attributes its deltas to exactly one request,
+    so parallel runs measure with :func:`run_completion` client timing.
+
+    Args:
+        base_url: Server root, for example ``http://127.0.0.1:8080``.
+        model: Model name as served by the endpoint.
+        prompts: One prompt per concurrent request; ``len(prompts)`` is the
+            concurrency level.
+        gen_tokens: Maximum tokens to generate per request.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        One :class:`RunResult` per prompt, in prompt order.
+
+    Raises:
+        RuntimeError: If a request generates no tokens; the first failure
+            is re-raised after the remaining requests finish.
+        urllib.error.URLError: If the server is unreachable or times out.
+    """
+    with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+        return list(
+            pool.map(
+                lambda prompt: run_completion(
+                    base_url, model, prompt, gen_tokens, timeout
+                ),
+                prompts,
+            )
+        )
 
 
 def parse_metrics_text(text: str, prefix: str = "sglang:") -> Dict[str, float]:
@@ -921,6 +971,32 @@ def parse_ctx(raw: str) -> List[int]:
     return values
 
 
+def parse_parallel(raw: str) -> List[int]:
+    """Parse a comma-separated ``--parallel`` value list.
+
+    Args:
+        raw: Comma-separated concurrency levels, for example ``2,4,8,16``.
+
+    Returns:
+        The parsed concurrency levels, in the order given.
+
+    Raises:
+        argparse.ArgumentTypeError: If any value is not one of
+            :data:`PARALLEL_OPTIONS`.
+    """
+    try:
+        values = [int(v.strip()) for v in raw.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid --parallel value: {raw!r}") from None
+    unknown = [v for v in values if v not in PARALLEL_OPTIONS]
+    if unknown:
+        levels = ", ".join(str(v) for v in PARALLEL_OPTIONS)
+        raise argparse.ArgumentTypeError(
+            f"--parallel levels must be one of {levels}: {raw!r}"
+        )
+    return values
+
+
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments.
 
@@ -966,6 +1042,17 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         help=(
             "comma-separated generation tasks (code, prose); required"
             " if non-interactive, otherwise the menu opens"
+        ),
+    )
+    ap.add_argument(
+        "--parallel",
+        type=parse_parallel,
+        metavar="LEVELS",
+        help=(
+            "comma-separated concurrent request levels, one of 2, 4, 8, 16"
+            " per level, for example 2,4,8,16; every level runs each"
+            " context/task combination with that many simultaneous requests"
+            " and reports aggregate tok/s (default: a single request)"
         ),
     )
     ap.add_argument(
@@ -1067,6 +1154,7 @@ def format_row(
     tok_s: float,
     source: str = "usage",
     draft_acceptance: float = 0.0,
+    parallel: int = 1,
 ) -> str:
     """Build one aligned results-table row.
 
@@ -1081,6 +1169,8 @@ def format_row(
             on the throughput columns.
         draft_acceptance: TensorFold speculative-draft acceptance rate; when
             above 0 a ``draft=NN%`` note is appended to the row.
+        parallel: Number of concurrent requests this row aggregates; when
+            above 1 a ``par=N`` note is appended to the row.
 
     Returns:
         The formatted row, aligned with the header columns. Unknown prefill
@@ -1099,6 +1189,8 @@ def format_row(
     )
     if draft_acceptance > 0:
         row += f"  draft={draft_acceptance:.0%}"
+    if parallel > 1:
+        row += f"  par={parallel}"
     return row
 
 
@@ -1111,8 +1203,17 @@ def bench_lengths(
     timeout: int,
     engine: str = "",
     ignore_server_timings: bool = False,
+    parallel: List[int] | None = None,
 ) -> None:
     """Benchmark every selected task at each context size and print the rows.
+
+    Concurrent runs (levels above 1) report one aggregate row per
+    context/task/level combination: token counts are totals across the
+    batch, the tok/s column is total generated tokens over the batch wall
+    time, and prefill is the total prompt tokens divided by the slowest
+    time to first token. The single-request server-metrics path cannot
+    attribute its per-request deltas to a batch, so concurrent rows always
+    use client-side timing.
 
     Args:
         base_url: Server root, for example ``http://127.0.0.1:8080``.
@@ -1123,38 +1224,126 @@ def bench_lengths(
         timeout: Request timeout in seconds.
         engine: Engine name from :func:`detect_engine`, for the measured path
             to select the server-metrics mechanism.
+        parallel: Concurrency levels per :data:`PARALLEL_OPTIONS`; None or
+            ``[1]`` runs a single request per combination.
 
     Returns:
         None. Each completed run is printed as one table row.
     """
+    levels = parallel or [1]
     for ctx in lengths:
         for task in tasks:
-            prompt = build_prompt(ctx, TASKS[task])
-            try:
-                result = run_completion_measured(
-                    base_url,
-                    model,
-                    prompt,
-                    gen_tokens,
-                    timeout,
-                    engine,
-                    ignore_server_timings,
+            for par in levels:
+                if par > 1:
+                    _bench_parallel_run(
+                        base_url,
+                        model,
+                        ctx,
+                        task,
+                        par,
+                        gen_tokens,
+                        timeout,
+                    )
+                    continue
+                prompt = build_prompt(ctx, TASKS[task])
+                try:
+                    result = run_completion_measured(
+                        base_url,
+                        model,
+                        prompt,
+                        gen_tokens,
+                        timeout,
+                        engine,
+                        ignore_server_timings,
+                    )
+                except Exception as e:  # noqa: BLE001 - report and continue
+                    print(f"{ctx:>8} {task:<6}   FAILED: {e}")
+                    continue
+                print(
+                    format_row(
+                        ctx,
+                        task,
+                        result.prompt_tok,
+                        result.gen_tok,
+                        result.prefill_tok_s,
+                        result.gen_tok_s,
+                        result.source,
+                        result.draft_acceptance,
+                    )
                 )
-            except Exception as e:  # noqa: BLE001 - report and continue
-                print(f"{ctx:>8} {task:<6}   FAILED: {e}")
-                continue
-            print(
-                format_row(
-                    ctx,
-                    task,
-                    result.prompt_tok,
-                    result.gen_tok,
-                    result.prefill_tok_s,
-                    result.gen_tok_s,
-                    result.source,
-                    result.draft_acceptance,
-                )
-            )
+
+
+def _bench_parallel_run(
+    base_url: str,
+    model: str,
+    ctx: int,
+    task: str,
+    parallel: int,
+    gen_tokens: int,
+    timeout: int,
+) -> None:
+    """Run one context/task combination at one concurrency level and print it.
+
+    Aggregates the per-request client measurements into one row: token
+    counts are batch totals, prefill is total prompt tokens over the
+    slowest TTFT, and the tok/s column is total generated tokens over the
+    batch wall time. The row is marked ``estimated`` when any request had
+    to fall back to chunk-counted tokens. Failures print a ``FAILED`` row.
+
+    Args:
+        base_url: Server root, for example ``http://127.0.0.1:8080``.
+        model: Model name as served by the endpoint.
+        ctx: Context size of this run, in kilotokens.
+        task: Generation task name, in :data:`TASKS`.
+        parallel: Number of concurrent requests; must be above 1.
+        gen_tokens: Maximum tokens to generate per request.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        None. The aggregate row or a ``FAILED`` line is printed.
+    """
+    try:
+        prompts = [build_prompt(ctx, TASKS[task]) for _ in range(parallel)]
+        t0 = time.perf_counter()
+        results = run_parallel_batch(base_url, model, prompts, gen_tokens, timeout)
+        wall_s = time.perf_counter() - t0
+    except Exception as e:  # noqa: BLE001 - report and continue
+        print(f"{ctx:>8} {task:<6}   FAILED: {e}")
+        return
+    prompt_tok = sum(r.prompt_tok for r in results)
+    gen_tok = sum(r.gen_tok for r in results)
+    ttft_s = max(r.ttft_s for r in results)
+    prefill_tok_s = prompt_tok / ttft_s if (prompt_tok and ttft_s > 0) else 0.0
+    tok_s = gen_tok / wall_s if wall_s > 0 else 0.0
+    source = (
+        "usage" if all(r.source == "usage" for r in results) else "estimated"
+    )
+    print(
+        format_row(
+            ctx,
+            task,
+            prompt_tok,
+            gen_tok,
+            prefill_tok_s,
+            tok_s,
+            source,
+            parallel=parallel,
+        )
+    )
+
+
+class BearerAuthHandler(urllib.request.BaseHandler):
+    """Request processor that stamps ``Authorization: Bearer`` on every request."""
+
+    def __init__(self, api_key: str) -> None:
+        urllib.request.BaseHandler.__init__(self)
+        self.api_key = api_key
+
+    def http_request(self, req: urllib.request.Request) -> urllib.request.Request:
+        req.add_unredirected_header("Authorization", f"Bearer {self.api_key}")
+        return req
+
+    https_request = http_request
 
 
 def install_api_key_handler(api_key: str) -> None:
@@ -1163,12 +1352,9 @@ def install_api_key_handler(api_key: str) -> None:
     Args:
         api_key: Secret sent on every request made through urllib.
     """
-    handler = urllib.request.BaseHandler()
-    handler.http_request = lambda req: (
-        req.add_unredirected_header("Authorization", f"Bearer {api_key}") or req
+    urllib.request.install_opener(
+        urllib.request.build_opener(BearerAuthHandler(api_key))
     )
-    handler.https_request = handler.http_request
-    urllib.request.install_opener(urllib.request.build_opener(handler))
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -1230,7 +1416,13 @@ def main(argv: List[str] | None = None) -> None:
     engine = detect_engine(base_url, args.timeout)
     engine_note = f" engine={engine}" if engine else " engine=unknown"
     print(f"llm-bench: {base_url}  model={model}{engine_note}")
-    print(f"gen_tokens={args.gen_tokens}, one run per context size")
+    parallel = args.parallel or [1]
+    runs_note = (
+        "one run per context size"
+        if parallel == [1]
+        else f"parallel levels {','.join(map(str, parallel))}, one run each"
+    )
+    print(f"gen_tokens={args.gen_tokens}, {runs_note}")
     hdr = format_header()
     print("\n" + hdr)
     print("-" * len(hdr))
@@ -1244,6 +1436,7 @@ def main(argv: List[str] | None = None) -> None:
         args.timeout,
         engine,
         args.ignore_server_timings,
+        parallel,
     )
 
 

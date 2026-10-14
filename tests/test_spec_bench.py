@@ -4,13 +4,14 @@ import argparse
 import io
 import json
 import re
+import time
 import urllib.error
 from unittest.mock import patch
 
 import pytest
 
 from llm_bench.spec_bench import (
-    install_api_key_handler,
+    BearerAuthHandler,
     METRIC_E2E_COUNT,
     METRIC_E2E_SUM,
     METRIC_GEN_TOKENS,
@@ -20,6 +21,7 @@ from llm_bench.spec_bench import (
     WARMUP_GEN_TOKENS,
     WARMUP_PROMPT,
     TASKS,
+    bench_lengths,
     build_prompt,
     choose_model,
     diff_metrics,
@@ -32,6 +34,7 @@ from llm_bench.spec_bench import (
     parse_args,
     parse_ctx,
     parse_metrics_text,
+    parse_parallel,
     parse_task,
     probe_tensorfold,
     query_models,
@@ -39,6 +42,7 @@ from llm_bench.spec_bench import (
     resolve_base_url,
     run_completion,
     run_completion_measured,
+    run_parallel_batch,
     snapshot_server_metrics,
     TENSORFOLD_ENGINE,
     warm_up,
@@ -234,6 +238,14 @@ class TestTableFormatting:
     def test_row_has_no_draft_note_when_zero(self) -> None:
         row = format_row(0, "code", 20, 93, 900.0, 191.65)
         assert "draft" not in row
+
+    def test_row_appends_parallel_note_when_above_one(self) -> None:
+        row = format_row(0, "code", 20, 93, 900.0, 191.65, parallel=4)
+        assert row.endswith("par=4")
+
+    def test_row_has_no_parallel_note_when_single(self) -> None:
+        row = format_row(0, "code", 20, 93, 900.0, 191.65)
+        assert "par=" not in row
 
 
 class TestRunCompletion:
@@ -904,15 +916,141 @@ class TestApiKey:
     def test_parses_api_key(self) -> None:
         args = parse_args(["http://localhost:8000", "--api-key", "sekrit"])
         assert args.api_key == "sekrit"
+
     def test_api_key_defaults_to_none(self) -> None:
         args = parse_args(["http://localhost:8000"])
         assert args.api_key is None
 
     def test_handler_adds_bearer_header(self) -> None:
-        handler = urllib.request.BaseHandler()
-        handler.http_request = lambda req: (
-            req.add_unredirected_header("Authorization", "Bearer sekrit") or req
-        )
-        handler.https_request = handler.http_request
         req = urllib.request.Request("http://localhost:8000/v1/models")
-        assert handler.http_request(req).get_header("Authorization") == "Bearer sekrit"
+        stamped = BearerAuthHandler("sekrit").http_request(req)
+        assert stamped.get_header("Authorization") == "Bearer sekrit"
+
+
+class TestParseParallel:
+    """parse_parallel and --parallel argument behavior."""
+
+    def test_parses_comma_separated_levels(self) -> None:
+        assert parse_parallel("2,4,8,16") == [2, 4, 8, 16]
+
+    def test_single_level(self) -> None:
+        assert parse_parallel("8") == [8]
+
+    def test_whitespace_is_ignored(self) -> None:
+        assert parse_parallel(" 2, 16 ") == [2, 16]
+
+    def test_rejects_unsupported_level(self) -> None:
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_parallel("3")
+
+    def test_rejects_non_numeric(self) -> None:
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_parallel("two")
+
+    def test_parallel_defaults_to_none(self) -> None:
+        args = parse_args(["--model", "m", "http://h:1"])
+        assert args.parallel is None
+
+    def test_custom_parallel(self) -> None:
+        args = parse_args(["--model", "m", "http://h:1", "--parallel", "2,4,8,16"])
+        assert args.parallel == [2, 4, 8, 16]
+
+    def test_invalid_parallel_exits(self) -> None:
+        with pytest.raises(SystemExit):
+            parse_args(["--model", "m", "http://h:1", "--parallel", "3,5"])
+
+
+class TestRunParallelBatch:
+    """run_parallel_batch concurrent execution behavior."""
+
+    def test_all_requests_run_concurrently(self) -> None:
+        active = 0
+        peak = 0
+
+        def fake_completion(
+            base_url: str, model: str, prompt: str, gen_tokens: int, timeout: int
+        ) -> RunResult:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            time.sleep(0.05)
+            active -= 1
+            return RunResult(0.0, 100.0, 10, 20, 0.5, "usage")
+
+        with patch("llm_bench.spec_bench.run_completion", side_effect=fake_completion):
+            results = run_parallel_batch(
+                "http://h:1", "m", ["a", "b", "c", "d"], 16, 5
+            )
+        assert peak == 4
+        assert len(results) == 4
+        assert all(r.gen_tok == 20 for r in results)
+
+    def test_results_keep_prompt_order(self) -> None:
+        def fake_completion(
+            base_url: str, model: str, prompt: str, gen_tokens: int, timeout: int
+        ) -> RunResult:
+            return RunResult(0.0, 1.0, 0, int(prompt), 0.1, "usage")
+
+        with patch("llm_bench.spec_bench.run_completion", side_effect=fake_completion):
+            results = run_parallel_batch("http://h:1", "m", ["1", "2", "3"], 16, 5)
+        assert [r.gen_tok for r in results] == [1, 2, 3]
+
+    def test_failure_propagates_after_all_complete(self) -> None:
+        with pytest.raises(RuntimeError), patch(
+            "llm_bench.spec_bench.run_completion", side_effect=RuntimeError("boom")
+        ):
+            run_parallel_batch("http://h:1", "m", ["a", "b"], 16, 5)
+
+
+class TestBenchLengthsParallel:
+    """bench_lengths concurrency-level reporting."""
+
+    def _result(self) -> RunResult:
+        return RunResult(40.0, 100.0, 1000, 500, 0.5, "usage")
+
+    def test_parallel_run_prints_aggregate_row(self, capsys) -> None:
+        def fake(*args) -> RunResult:
+            return self._result()
+
+        with patch("llm_bench.spec_bench.run_completion", side_effect=fake):
+            bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
+        out = capsys.readouterr().out
+        assert "par=2" in out
+        assert f"{2000:>13}" in out  # total prompt tokens
+        assert f"{1000:>10}" in out  # total generated tokens
+        assert "4000.00" in out  # aggregate prefill: 2000 / 0.5 slowest TTFT
+
+    def test_parallel_run_flags_mixed_token_sources(self, capsys) -> None:
+        results = [
+            RunResult(40.0, 100.0, 1000, 500, 0.5, "usage"),
+            RunResult(40.0, 100.0, 1000, 500, 0.5, "estimated"),
+        ]
+        with patch(
+            "llm_bench.spec_bench.run_completion", side_effect=results
+        ), patch(
+            "llm_bench.spec_bench.build_prompt", side_effect=lambda *a: "p"
+        ):
+            bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
+        out = capsys.readouterr().out
+        assert "*" in out  # estimated rows are asterisked
+
+    def test_parallel_failure_prints_failed_row(self, capsys) -> None:
+        with patch(
+            "llm_bench.spec_bench.run_completion", side_effect=RuntimeError("boom")
+        ):
+            bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
+        out = capsys.readouterr().out
+        assert "FAILED" in out
+        assert "par=" not in out
+
+    def test_single_run_keeps_measured_path(self, capsys) -> None:
+        with patch(
+            "llm_bench.spec_bench.run_completion_measured", return_value=self._result()
+        ) as measured, patch(
+            "llm_bench.spec_bench.run_completion"
+        ) as client:
+            bench_lengths("http://h:1", "m", [2], ["code"], 16, 5)
+        out = capsys.readouterr().out
+        measured.assert_called_once()
+        client.assert_not_called()
+        assert "par=" not in out
