@@ -128,18 +128,18 @@ Options:
 | `--ctx` | Comma-separated context sizes in kilotokens, minimum 2, for example `2,8,16` (optional; omit to pick from the interactive menu) |
 | `--task` | Comma-separated generation tasks (`code`, `prose`; optional; omit to pick from the interactive menu) |
 | `--parallel` | Comma-separated threads per run, each one of 1, 2, 4, 8, 16, for example `1,2,4,8,16`; every level runs each context/task combination with that many simultaneous requests and reports one row with prefill and tok/s combined across threads (optional; omit to pick from the interactive menu, or for single-request runs when no terminal is attached) |
-| `--gen-tokens` | Max tokens generated per run (default `2048`) |
+| `--gen-tokens` | Max tokens generated per run (default `256`) |
 | `--timeout` | Request timeout in seconds (default `600`) |
 
 Example output:
 
 ```text
 llm-bench: http://127.0.0.1:8080  model=qwen2.5-7b-instruct
-gen_tokens=2048, one run per context size
+gen_tokens=256, one run per context size
 
      ctx task      prompt_tok    gen_tok    prefill tok/s        tok/s
 ----------------------------------------------------------------------
-      8k code            6160       2048          4520.31       178.40
+      8k code            6160        256          4520.31       178.40
       8k prose           6201        180          4108.83       165.12
 
 ```

@@ -91,7 +91,7 @@ class TestParseArgs:
         args = parse_args(["--model", "m", "http://10.0.0.5:8080"])
         assert args.model == "m"
         assert args.base_url == "http://10.0.0.5:8080"
-        assert args.gen_tokens == 2048
+        assert args.gen_tokens == 256
 
     def test_missing_base_url_exits(self) -> None:
         with pytest.raises(SystemExit):
