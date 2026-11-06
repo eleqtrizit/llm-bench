@@ -4,7 +4,7 @@
 Benchmarks generation throughput (tok/s) at prompt/context lengths of
 2, 8, 32, 64, 128 and 200 kilotokens (or override with ``--ctx``). Runs
 use 1, 2, 4, 8, or 16 threads per run (``--parallel``); every run prints
-one row, and multithreaded rows combine the per-thread rates.
+one row, and multithreaded rows report batch-level wall-clock rates.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ MIN_CTX_K = 2
 
 # Threads per run accepted by --parallel. Level 1 is a single request;
 # higher levels run that many streaming requests at once for every
-# context/task combination and combine the per-thread rates in one row.
+# context/task combination and report batch wall-clock rates in one row.
 PARALLEL_OPTIONS = (1, 2, 4, 8, 16)
 
 # Prometheus metrics used for server-reported throughput numbers. The
@@ -183,6 +183,12 @@ class RunResult:
             block attached to the completion response.
         draft_acceptance: Fraction of drafted speculative tokens the engine
             accepted, from the TensorFold telemetry block; 0.0 when absent.
+        t_start: Client ``perf_counter`` timestamp when the request was sent.
+        t_first: Client ``perf_counter`` timestamp of the first payload token.
+        t_last: Client ``perf_counter`` timestamp of the last payload token.
+            The three timestamps share one clock across threads, so a
+            concurrent batch can be measured over its real wall-clock
+            windows; all are 0.0 when unknown.
     """
 
     prefill_tok_s: float
@@ -192,6 +198,9 @@ class RunResult:
     ttft_s: float
     source: str
     draft_acceptance: float = 0.0
+    t_start: float = 0.0
+    t_first: float = 0.0
+    t_last: float = 0.0
 
 
 def run_completion(
@@ -253,6 +262,7 @@ def run_completion(
     engine_stats: Dict[str, float] | None = None
     spec_stats: Dict[str, float] = {}
     ttft = 0.0
+    t_last = 0.0
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw_line in resp:
@@ -289,9 +299,12 @@ def run_completion(
                     or delta.get("reasoning_content")
                 ):
                     n_chunk_tokens += 1
+                    t_last = time.perf_counter()
                     if ttft == 0.0:
-                        ttft = time.perf_counter() - t0
-    total = time.perf_counter() - t0
+                        ttft = t_last - t0
+    # Decode ends at the last token, not after the trailing usage/[DONE]
+    # chunks, so the decode window covers only token generation.
+    total = (t_last - t0) if t_last else (time.perf_counter() - t0)
 
     n_prompt_server = (usage or {}).get("prompt_tokens", 0)
     n_gen_server = (usage or {}).get("completion_tokens", 0)
@@ -327,11 +340,10 @@ def run_completion(
             n_gen = int(timings["predicted_n"])
             gen_tok_s = n_gen / (float(timings["predicted_ms"]) / 1000.0)
         else:
-            gen_tok_s = n_gen / max(total - ttft, 1e-9)
+            gen_tok_s = decode_rate(n_gen, total - ttft)
         source = "timings"
     else:
-        gen_seconds = max(total - ttft, 1e-9)
-        gen_tok_s = n_gen / gen_seconds
+        gen_tok_s = decode_rate(n_gen, total - ttft)
         prefill_tok_s = n_prompt / ttft if (n_prompt and ttft > 0) else 0.0
         source = "usage" if n_gen_server else "estimated"
 
@@ -345,7 +357,76 @@ def run_completion(
         ttft_s=ttft,
         source=source,
         draft_acceptance=draft_acceptance,
+        t_start=t0,
+        t_first=t0 + ttft if ttft else 0.0,
+        t_last=t_last,
     )
+
+
+def decode_rate(n_gen: float, decode_seconds: float) -> float:
+    """Compute decode tok/s over the window that starts at the first token.
+
+    The first token arrives at TTFT, the moment the decode window opens, so
+    it belongs to prefill. A window from first token to last token spans
+    ``n_gen - 1`` decode steps.
+
+    Args:
+        n_gen: Generated tokens, including the first one.
+        decode_seconds: Seconds from the first token to the last.
+
+    Returns:
+        The decode throughput, or 0.0 when fewer than two tokens were
+        generated or the window is empty.
+    """
+    if n_gen < 2 or decode_seconds <= 0:
+        return 0.0
+    return (n_gen - 1) / decode_seconds
+
+
+@dataclass(frozen=True)
+class BatchRates:
+    """Aggregate throughput of one concurrent batch, from wall-clock windows.
+
+    Attributes:
+        prefill_tok_s: Total prompt tokens divided by the time from the first
+            request sent to the last request's first token.
+        gen_tok_s: Total decode tokens (each request's tokens after its
+            first) divided by the time from the first request's first token
+            to the last token of any request.
+    """
+
+    prefill_tok_s: float
+    gen_tok_s: float
+
+
+def aggregate_batch_rates(results: List[RunResult]) -> BatchRates:
+    """Combine concurrent requests into batch-level prefill and decode rates.
+
+    Summing per-request rates overstates throughput. Each request's TTFT
+    includes the time it waited behind the others' prefill, and the
+    requests' decode windows do not fully overlap. When the server prefills
+    4 prompts one after another, the sum of ``prompt_tok / ttft`` comes out
+    about twice the real rate. Dividing total tokens by the shared
+    wall-clock window of each phase gives the throughput the server
+    actually delivered.
+
+    Args:
+        results: One result per concurrent request, with client timestamps.
+
+    Returns:
+        The batch :class:`BatchRates`; a rate is 0.0 when its window or
+        token total is empty.
+    """
+    timed = [r for r in results if r.t_start and r.t_first]
+    if not timed:
+        return BatchRates(0.0, 0.0)
+    prompt_tok = sum(r.prompt_tok for r in timed)
+    prefill_window = max(r.t_first for r in timed) - min(r.t_start for r in timed)
+    prefill = prompt_tok / prefill_window if prompt_tok and prefill_window > 0 else 0.0
+    decode_tok = sum(max(r.gen_tok - 1, 0) for r in timed)
+    decode_window = max(r.t_last for r in timed) - min(r.t_first for r in timed)
+    decode = decode_tok / decode_window if decode_tok and decode_window > 0 else 0.0
+    return BatchRates(prefill, decode)
 
 
 def run_parallel_batch(
@@ -521,11 +602,14 @@ def metrics_to_rates(
     decode_seconds = e2e - ttft
     return RunResult(
         prefill_tok_s=prompt_tok / ttft if prompt_tok > 0 else 0.0,
-        gen_tok_s=gen_tok / decode_seconds if gen_tok > 0 else 0.0,
+        gen_tok_s=decode_rate(gen_tok, decode_seconds),
         prompt_tok=int(prompt_tok or client_result.prompt_tok),
         gen_tok=int(gen_tok or client_result.gen_tok),
         ttft_s=client_result.ttft_s,
         source="sglang",
+        t_start=client_result.t_start,
+        t_first=client_result.t_first,
+        t_last=client_result.t_last,
     )
 
 
@@ -1087,7 +1171,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
             "comma-separated threads per run, one of 1, 2, 4, 8, 16, for"
             " example 2,4,8,16; every level runs each context/task"
             " combination with that many simultaneous requests and reports"
-            " one row with prefill and tok/s combined across threads"
+            " one row with batch-level prefill and tok/s"
             " (omit to pick from an interactive menu when a terminal is"
             " attached; otherwise a single request)"
         ),
@@ -1203,11 +1287,11 @@ def format_row(
         gen_tok: Completion tokens generated in this run; for
             multithreaded runs, the combined total across threads.
         prefill_tok_s: Estimated prefill throughput; 0.0 means unknown.
-            For multithreaded runs, the combined total of the per-thread
-            rates.
+            For multithreaded runs, the batch rate from
+            :func:`aggregate_batch_rates`.
         tok_s: Generation throughput of this run in tokens per second.
-            For multithreaded runs, the combined total of the per-thread
-            rates.
+            For multithreaded runs, the batch rate from
+            :func:`aggregate_batch_rates`.
         source: Provenance of the rates; ``estimated`` rows get an asterisk
             on the throughput columns.
         draft_acceptance: TensorFold speculative-draft acceptance rate; when
@@ -1250,8 +1334,9 @@ def bench_lengths(
     Every run prints one row with its thread count in the ``threads``
     column. Level 1 keeps the single-request server-metrics path; higher
     levels print one combined row per batch, with token counts totaled
-    across threads and prefill and tok/s the combined total of the
-    per-thread client-measured rates. The single-request server-metrics
+    across threads and prefill and tok/s measured over the batch's
+    wall-clock windows (see :func:`aggregate_batch_rates`). The
+    single-request server-metrics
     path cannot attribute its per-request deltas to a batch, so
     concurrent runs always use client-side timing.
 
@@ -1325,10 +1410,10 @@ def _bench_parallel_run(
     """Run one context/task combination at one concurrency level and print it.
 
     One row reports the whole batch: token counts are totaled across
-    threads, prefill and tok/s are the combined total of the per-thread
-    client-measured rates, and draft acceptance is averaged across threads
-    that report one. The row keeps the per-request source when every
-    thread agrees on it, otherwise it is marked ``estimated``. The
+    threads, prefill and tok/s come from :func:`aggregate_batch_rates`
+    over the batch's wall-clock windows, and draft acceptance is averaged
+    across threads that report one. The row is marked ``estimated`` when
+    any thread chunk-counted its tokens. The
     single-request server-metrics path cannot attribute its per-request
     deltas to a batch, so concurrent runs always measure with
     :func:`run_completion` client timing. A failure in any request fails
@@ -1354,10 +1439,12 @@ def _bench_parallel_run(
         return
     prompt_tok = sum(r.prompt_tok for r in results)
     gen_tok = sum(r.gen_tok for r in results)
-    prefill_tok_s = sum(r.prefill_tok_s for r in results)
-    tok_s = sum(r.gen_tok_s for r in results)
-    sources = {r.source for r in results}
-    source = sources.pop() if len(sources) == 1 else "estimated"
+    rates = aggregate_batch_rates(results)
+    # Batch rates are always client wall-clock; flag the row when any
+    # thread's token counts were chunk-counted rather than server-reported.
+    source = (
+        "estimated" if any(r.source == "estimated" for r in results) else "usage"
+    )
     drafts = [r.draft_acceptance for r in results if r.draft_acceptance > 0]
     draft_acceptance = sum(drafts) / len(drafts) if drafts else 0.0
     print(
@@ -1366,8 +1453,8 @@ def _bench_parallel_run(
             task,
             prompt_tok,
             gen_tok,
-            prefill_tok_s,
-            tok_s,
+            rates.prefill_tok_s,
+            rates.gen_tok_s,
             source,
             draft_acceptance,
             threads=parallel,
@@ -1473,7 +1560,7 @@ def main(argv: List[str] | None = None) -> None:
         "one run per context size"
         if parallel == [1]
         else f"threads {','.join(map(str, parallel))},"
-        " prefill and tok/s combined across threads"
+        " prefill and tok/s over each batch's wall clock"
     )
     print(f"gen_tokens={args.gen_tokens}, {runs_note}")
     hdr = format_header()

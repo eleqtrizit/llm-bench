@@ -21,7 +21,9 @@ from llm_bench.spec_bench import (
     WARMUP_GEN_TOKENS,
     WARMUP_PROMPT,
     TASKS,
+    aggregate_batch_rates,
     bench_lengths,
+    decode_rate,
     build_prompt,
     choose_model,
     diff_metrics,
@@ -862,7 +864,8 @@ class TestMetricsToRates:
         assert r is not None
         assert r.source == "sglang"
         assert r.prefill_tok_s == 1000 / 0.5
-        assert r.gen_tok_s == 200 / (2.5 - 0.5)
+        # The first token lands at TTFT, so e2e - ttft spans 199 decode steps.
+        assert r.gen_tok_s == 199 / (2.5 - 0.5)
         assert r.gen_tok == 200
         assert r.prompt_tok == 1000
 
@@ -913,7 +916,7 @@ class TestRunCompletionMeasured:
             r = run_completion_measured("http://host:1", "m", "hi", 8, 10)
         assert r.source == "sglang"
         assert r.prefill_tok_s == 1000 / 0.5
-        assert r.gen_tok_s == 200 / 2.0
+        assert r.gen_tok_s == 199 / 2.0
 
     def test_falls_back_when_metrics_endpoint_missing(self, capsys) -> None:
         client = _client_result()
@@ -1040,13 +1043,81 @@ class TestRunParallelBatch:
             run_parallel_batch("http://h:1", "m", ["a", "b"], 16, 5)
 
 
+def _timed(
+    prompt_tok: int,
+    gen_tok: int,
+    t_start: float,
+    t_first: float,
+    t_last: float,
+    source: str = "usage",
+) -> RunResult:
+    """Build a RunResult with client timestamps for batch-rate tests."""
+    # Offset the clock so a 0.0 timestamp in the test still reads as "set".
+    base = 1000.0
+    return RunResult(
+        0.0, 0.0, prompt_tok, gen_tok, t_first - t_start, source,
+        t_start=base + t_start, t_first=base + t_first, t_last=base + t_last,
+    )
+
+
+class TestDecodeRate:
+    """decode_rate behavior."""
+
+    def test_excludes_the_first_token(self) -> None:
+        assert decode_rate(101, 2.0) == 50.0
+
+    def test_single_token_has_no_decode_rate(self) -> None:
+        assert decode_rate(1, 1.0) == 0.0
+
+    def test_empty_window_is_zero(self) -> None:
+        assert decode_rate(10, 0.0) == 0.0
+
+
+class TestAggregateBatchRates:
+    """aggregate_batch_rates wall-clock batch measurement."""
+
+    def test_serialized_prefill_is_not_overstated(self) -> None:
+        # A server that prefills 4 x 8000-token prompts one after another at
+        # 10k tok/s: first tokens at 0.8, 1.6, 2.4, 3.2s. Summing per-request
+        # prompt_tok / ttft would claim ~20.8k tok/s.
+        results = [
+            _timed(8000, 2, 0.0, 0.8 * (i + 1), 0.8 * (i + 1) + 0.1)
+            for i in range(4)
+        ]
+        rates = aggregate_batch_rates(results)
+        assert rates.prefill_tok_s == pytest.approx(10000.0)
+
+    def test_fully_batched_requests_match_per_request_sum(self) -> None:
+        results = [_timed(1000, 101, 0.0, 1.0, 3.0) for _ in range(4)]
+        rates = aggregate_batch_rates(results)
+        assert rates.prefill_tok_s == pytest.approx(4000.0)
+        assert rates.gen_tok_s == pytest.approx(4 * 100 / 2.0)
+
+    def test_staggered_decode_uses_the_shared_window(self) -> None:
+        # Decode windows 1..2s and 2..3s do not overlap: the batch produced
+        # 200 decode tokens over 2s, not 100 + 100 tok/s.
+        results = [
+            _timed(10, 101, 0.0, 1.0, 2.0),
+            _timed(10, 101, 0.0, 2.0, 3.0),
+        ]
+        assert aggregate_batch_rates(results).gen_tok_s == pytest.approx(100.0)
+
+    def test_untimed_results_give_zero(self) -> None:
+        rates = aggregate_batch_rates([RunResult(1.0, 1.0, 10, 10, 0.1, "usage")])
+        assert rates.prefill_tok_s == 0.0
+        assert rates.gen_tok_s == 0.0
+
+
 class TestBenchLengthsParallel:
     """bench_lengths concurrency-level reporting."""
 
     def test_parallel_run_prints_one_combined_row(self, capsys) -> None:
+        # Both sent at t=0; first tokens at 5s and 7s, last tokens at 12s
+        # and 17s. Prefill: 2100 tok / 7s = 300. Decode: (499 + 399) tok
+        # over 5s..17s = 898 / 12 = 74.83.
         results = [
-            RunResult(40.0, 90.0, 1000, 500, 0.5, "usage"),
-            RunResult(50.0, 80.0, 1100, 400, 0.6, "usage"),
+            _timed(1000, 500, 0.0, 5.0, 12.0),
+            _timed(1100, 400, 0.0, 7.0, 17.0),
         ]
         with patch(
             "llm_bench.spec_bench.run_completion", side_effect=results
@@ -1058,13 +1129,13 @@ class TestBenchLengthsParallel:
         data = [line for line in out.splitlines() if line.strip().startswith("2k")]
         assert len(data) == 1
         assert data[0].split() == [
-            "2k", "code", "2", "2100", "900", "90.00", "170.00"
+            "2k", "code", "2", "2100", "900", "300.00", "74.83"
         ]
 
     def test_mixed_sources_are_flagged_estimated(self, capsys) -> None:
         results = [
-            RunResult(40.0, 90.0, 1000, 500, 0.5, "usage"),
-            RunResult(40.0, 80.0, 1000, 500, 0.5, "estimated"),
+            _timed(1000, 501, 0.0, 10.0, 20.0),
+            _timed(1000, 501, 0.0, 10.0, 20.0, source="estimated"),
         ]
         with patch(
             "llm_bench.spec_bench.run_completion", side_effect=results
@@ -1073,8 +1144,8 @@ class TestBenchLengthsParallel:
         ):
             bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
         out = capsys.readouterr().out
-        assert "80.00*" in out  # summed prefill, asterisked
-        assert "170.00*" in out  # summed tok/s, asterisked
+        assert "200.00*" in out  # batch prefill, asterisked
+        assert "100.00*" in out  # batch tok/s, asterisked
 
     def test_draft_acceptance_is_averaged_across_threads(self, capsys) -> None:
         results = [
@@ -1092,8 +1163,8 @@ class TestBenchLengthsParallel:
 
     def test_shared_source_is_kept(self, capsys) -> None:
         results = [
-            RunResult(40.0, 90.0, 1000, 500, 0.5, "timings"),
-            RunResult(40.0, 80.0, 1000, 500, 0.5, "timings"),
+            _timed(1000, 500, 0.0, 1.0, 2.0, source="timings"),
+            _timed(1000, 500, 0.0, 1.0, 2.0, source="timings"),
         ]
         with patch(
             "llm_bench.spec_bench.run_completion", side_effect=results
@@ -1102,7 +1173,7 @@ class TestBenchLengthsParallel:
         ):
             bench_lengths("http://h:1", "m", [2], ["code"], 16, 5, parallel=[2])
         out = capsys.readouterr().out
-        assert "*" not in out  # not estimated: every thread reported timings
+        assert "*" not in out  # not estimated: every thread reported counts
 
     def test_parallel_failure_prints_failed_row(self, capsys) -> None:
         with patch(

@@ -107,7 +107,12 @@ The `--parallel` flag sets how many threads, meaning simultaneous requests,
 each run uses. The allowed levels are 1, 2, 4, 8, and 16, comma-separated to
 sweep several levels in one run. Every run reports one row with its thread
 count in the `threads` column: token counts are totaled across threads, and
-prefill and tok/s are the combined total of the per-thread rates.
+prefill and tok/s are batch-level rates measured over wall-clock windows.
+Prefill is total prompt tokens divided by the time from the first request
+sent to the last request's first token. tok/s is total decode tokens divided
+by the time from the first first-token to the last token of any request.
+Summing per-request rates would overstate throughput, because each request's
+time to first token includes time spent queued behind the other prompts.
 Multithreaded rows use client-side timing because the single-request
 server-metrics path cannot attribute its per-request deltas to a batch.
 Omit the flag on a terminal and a multi-select menu opens with the same
@@ -127,7 +132,7 @@ Options:
 | `BASE_URL` | Server base URL, for example `http://127.0.0.1:8080`. A trailing `/v1` is accepted, and `/v1` is probed if the bare URL does not answer (required) |
 | `--ctx` | Comma-separated context sizes in kilotokens, minimum 2, for example `2,8,16` (optional; omit to pick from the interactive menu) |
 | `--task` | Comma-separated generation tasks (`code`, `prose`; optional; omit to pick from the interactive menu) |
-| `--parallel` | Comma-separated threads per run, each one of 1, 2, 4, 8, 16, for example `1,2,4,8,16`; every level runs each context/task combination with that many simultaneous requests and reports one row with prefill and tok/s combined across threads (optional; omit to pick from the interactive menu, or for single-request runs when no terminal is attached) |
+| `--parallel` | Comma-separated threads per run, each one of 1, 2, 4, 8, 16, for example `1,2,4,8,16`; every level runs each context/task combination with that many simultaneous requests and reports one row with batch-level prefill and tok/s (optional; omit to pick from the interactive menu, or for single-request runs when no terminal is attached) |
 | `--gen-tokens` | Max tokens generated per run (default `256`) |
 | `--timeout` | Request timeout in seconds (default `600`) |
 
