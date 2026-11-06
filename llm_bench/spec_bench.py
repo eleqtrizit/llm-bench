@@ -84,6 +84,14 @@ METRICS_SNAPSHOT_RETRIES = 5
 # engine ("tensorfold") and carries its own prefill/decode accounting.
 TENSORFOLD_ENGINE = "tensorfold"
 
+# Flare serves Prometheus counters under the ``flare_`` family prefix but no
+# TTFT/E2E latency histograms, so flare runs use client timing for prefill
+# and decode; its /metrics counters only supply the speculative draft
+# acceptance rate.
+FLARE_ENGINE = "flare"
+FLARE_SPEC_OFFERED = "flare_speculative_offered_drafts_total"
+FLARE_SPEC_ACCEPTED = "flare_speculative_accepted_drafts_total"
+
 
 def metric_prefix(engine: str = DEFAULT_ENGINE) -> str:
     """Return the Prometheus family prefix for a detected engine.
