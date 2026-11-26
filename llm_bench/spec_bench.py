@@ -671,16 +671,13 @@ def run_completion_measured(
 
     prefix = metric_prefix(engine)
     names = metric_full_names(engine)
-    metrics_unavailable: Exception | None = None
     before: Dict[str, float] | None = None
     try:
         before = snapshot_server_metrics(
             base_url, timeout, required=tuple(names.values()), prefix=prefix
         )
-    except (RuntimeError, urllib.error.URLError) as e:
-        if isinstance(e, urllib.error.URLError):
-            raise
-        metrics_unavailable = e
+    except RuntimeError:
+        pass
 
     result = run_completion(
         base_url, model, prompt, gen_tokens, timeout, ignore_server_timings
@@ -688,8 +685,6 @@ def run_completion_measured(
     if result.source == TENSORFOLD_ENGINE:
         return result
     if before is None:
-        if metrics_unavailable is not None:
-            print("  (server metrics unavailable; prefill/decode from client-side timing)")
         return result
 
     deadline = time.monotonic() + METRICS_POLL_DEADLINE_S
