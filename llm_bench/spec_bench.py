@@ -689,14 +689,18 @@ def run_completion_measured(
         return result
     if before is None:
         if metrics_unavailable is not None:
-            print(f"  (server metrics unavailable, using client timing: {metrics_unavailable})")
+            print("  (server metrics unavailable; prefill/decode from client-side timing)")
         return result
 
     deadline = time.monotonic() + METRICS_POLL_DEADLINE_S
     while True:
-        after = snapshot_server_metrics(
-            base_url, timeout, required=tuple(names.values()), prefix=prefix
-        )
+        try:
+            after = snapshot_server_metrics(
+                base_url, timeout, required=tuple(names.values()), prefix=prefix
+            )
+        except RuntimeError:
+            # Metrics disappeared mid-run; fall back to client timing quietly.
+            return result
         rates = metrics_to_rates(diff_metrics(before, after), result, names)
         if rates is not None:
             return rates

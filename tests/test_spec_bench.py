@@ -929,7 +929,7 @@ class TestRunCompletionMeasured:
         ):
             r = run_completion_measured("http://host:1", "m", "hi", 8, 10)
         assert r is client
-        assert "client timing" in capsys.readouterr().out
+        assert "client-side timing" in capsys.readouterr().out
 
     def test_falls_back_after_poll_deadline(self) -> None:
         client = _client_result()
